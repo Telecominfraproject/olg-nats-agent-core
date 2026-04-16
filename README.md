@@ -4,7 +4,7 @@ Core NATS agent library for OLG
 
 `olg-nats-agent-core` is a shared Go library for agents that communicate over a NATS bus.
 
-It provides common bus-facing functionality such as:
+It is intended to provide common bus-facing functionality such as:
 - NATS connection and reconnect handling
 - JetStream and Key-Value access
 - standard subject naming
@@ -32,9 +32,29 @@ In simple words:
 
 ---
 
+## Current status
+
+This repository is currently at **Phase 1 bootstrap**.
+
+The current code defines the public API surface and shared message contract only:
+- public config types
+- public client method signatures
+- standard envelope and storage models
+- typed public errors
+- logger and metrics interfaces
+
+Runtime behavior is intentionally **not implemented yet** in this phase.
+That means transport/session/KV/subject/publish-subscribe/reconnect logic is
+deferred to later phases.
+
+---
+
 ## What this library does
 
-This library helps agents:
+The intended end-state of this library is to help agents:
+
+This section describes the target design and is not fully implemented in the
+current Phase 1 bootstrap.
 
 - connect to NATS
 - reconnect after temporary disconnects
@@ -78,6 +98,9 @@ The library is designed around the idea that agents use shared transport/state h
 ---
 
 ## Basic communication model
+
+The flows below describe the target design. They are not fully implemented in
+the current Phase 1 bootstrap.
 
 ### Configure flow
 
