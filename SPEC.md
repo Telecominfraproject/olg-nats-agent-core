@@ -122,6 +122,16 @@ The configure notification is a trigger telling the target agent to reload desir
 
 The notification is **not** the full desired configuration payload.
 
+Configure notification required fields are:
+- `version`
+- `rpc_id`
+- `target`
+- `command_type`
+- `uuid`
+- `kv_bucket`
+- `kv_key`
+- `timestamp`
+
 ### 6.3 Configure result contract
 
 Configure result/status messages must include:
@@ -134,24 +144,38 @@ This is required so the cloud-facing side can determine:
 
 `rpc_id` alone is not sufficient for configure outcomes.
 
-### 6.4 Configure submission failure semantics
+### 6.4 SubmitConfigure failure semantics
 
-SubmissionAck is a direct API return value from configure submission calls.
-It is not a bus-delivered message and is not published or consumed over NATS subjects.
+`SubmitConfigure(...)` succeeds only when both steps complete successfully:
+1. desired config is written to KV
+2. configure notification is published
 
-Configure submission must expose clear failure outcomes:
+When either step fails, the call returns a submission error and does not return a successful `SubmissionAck`.
+`SubmissionAck` is a direct API return value from `SubmitConfigure(...)`, not a bus-delivered message.
 
-- validation failure:
-  - submission is rejected
-  - desired config is not written to KV
-  - configure notification is not published
-- KV store failure:
-  - submission fails
-  - configure notification is not published
-- notify publish failure after KV store success:
-  - submission fails with explicit publish-failure semantics
-  - desired config remains stored in KV (no implicit rollback)
-  - callers may retry notification or re-submit based on policy
+The following cases define caller-visible behavior:
+
+- Validation failure
+  Missing or invalid required fields.
+  Operational result: no KV write, no notification publish, returns submission error.
+
+- KV store failure
+  Desired config could not be persisted.
+  Operational result: no successful `SubmissionAck`, no notification publish, returns submission error.
+
+- Notification publish failure after KV write success
+  Desired config was already written to KV, but notification publish failed.
+  Operational result: returns submission error with no successful `SubmissionAck`; desired state may already have changed in KV.
+
+- Context timeout or cancellation
+  Context ended before submission completed.
+  Operational result: returns submission error. Side effects depend on how far execution progressed before context end:
+  if cancellation happened before KV write, no state change; if cancellation happened after KV write, desired state may already be updated even when the call returns error.
+
+Caller guidance:
+- Treat `SubmissionAck` as transport acceptance only, not apply success.
+- Treat apply success as confirmed only by result/status from the owning target agent.
+- For retries after error, assume partial side effects are possible and use config UUID comparison to determine current desired state.
 
 ---
 

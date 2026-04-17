@@ -2,7 +2,7 @@ Read PROMPTS/IMPLEMENTATION_PROMPT.md carefully.
 Also read SPEC.md for design context.
 Use PROMPTS/IMPLEMENTATION_PROMPT.md as the primary implementation source of truth for code generation scope and API shape.
 
-Generate only the initial project bootstrap for a production-grade Go library module named nats-agent-core.
+Generate only the initial project bootstrap for a production-grade Go library module named olg-nats-agent-core.
 
 In this phase, create only:
 1. go.mod
