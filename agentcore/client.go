@@ -2,8 +2,15 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/routerarchitects/nats-agent-core/internal/kv"
+	"github.com/routerarchitects/nats-agent-core/internal/runtimeerr"
+	"github.com/routerarchitects/nats-agent-core/internal/session"
 )
 
 // ConfigureHandler handles configure notifications for a target.
@@ -81,8 +88,13 @@ func WithErrorSink(fn func(error)) Option {
 type Client struct {
 	mu      sync.RWMutex
 	cfg     Config
-	health  HealthSnapshot
 	options clientOptions
+
+	session *session.Manager
+	kv      *kv.Store
+
+	nextWatchID uint64
+	watches     map[uint64]StopFunc
 }
 
 // New validates public options and constructs a bootstrap client facade.
@@ -99,12 +111,33 @@ func New(cfg Config, opts ...Option) (*Client, error) {
 		}
 	}
 
+	if options.logger == nil {
+		options.logger = cfg.Observe.Logger
+	}
+	if options.metrics == nil {
+		options.metrics = cfg.Observe.Metrics
+	}
+
+	runtime, err := session.NewManager(toSessionConfig(cfg), session.Hooks{
+		Logger:    options.logger,
+		Metrics:   options.metrics,
+		ErrorSink: options.errorSink,
+	})
+	if err != nil {
+		return nil, toPublicError(err)
+	}
+
+	store, err := kv.NewStore(runtime, options.errorSink)
+	if err != nil {
+		return nil, toPublicError(err)
+	}
+
 	return &Client{
-		cfg: cfg,
-		health: HealthSnapshot{
-			State: StateNew,
-		},
+		cfg:     cfg,
 		options: options,
+		session: runtime,
+		kv:      store,
+		watches: make(map[uint64]StopFunc),
 	}, nil
 }
 
@@ -115,43 +148,43 @@ func (c *Client) Config() Config {
 	return c.cfg
 }
 
-// Start begins the client lifecycle. Transport/session setup is deferred.
+// Start begins the client lifecycle.
 func (c *Client) Start(ctx context.Context) error {
-	_ = ctx
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.health.State = StateConnecting
-
-	return &Error{
-		Code:      CodeNotImplemented,
-		Op:        "start",
-		Message:   "Start is not implemented in bootstrap phase",
-		Retryable: false,
-	}
+	return toPublicError(c.session.Start(ctx))
 }
 
-// Close ends the client lifecycle. Drain behavior is deferred.
+// Close ends the client lifecycle with watch cleanup and connection drain.
 func (c *Client) Close(ctx context.Context) error {
-	_ = ctx
+	watchErr := c.stopAllWatches()
+	sessionErr := toPublicError(c.session.Close(ctx))
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.health.State = StateDraining
-
-	return &Error{
-		Code:      CodeNotImplemented,
-		Op:        "close",
-		Message:   "Close is not implemented in bootstrap phase",
-		Retryable: false,
+	if watchErr != nil && sessionErr == nil {
+		return &Error{
+			Code:      CodeShutdown,
+			Op:        "close_stop_watches",
+			Message:   "failed to stop one or more desired-config watches",
+			Retryable: false,
+			Err:       watchErr,
+		}
 	}
+	if watchErr != nil && sessionErr != nil {
+		return &Error{
+			Code:      CodeShutdown,
+			Op:        "close",
+			Message:   "close failed with watch-stop and session shutdown errors",
+			Retryable: true,
+			Err:       errors.Join(watchErr, sessionErr),
+		}
+	}
+	return sessionErr
 }
 
 // Health returns the latest public health snapshot.
 func (c *Client) Health() HealthSnapshot {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.health
+	if c.session == nil {
+		return HealthSnapshot{State: StateNew}
+	}
+	return fromSessionHealth(c.session.HealthSnapshot())
 }
 
 // SubmitConfigure accepts a configure command for later-phase transport logic.
@@ -206,57 +239,62 @@ func (c *Client) PublishStatus(ctx context.Context, msg StatusEnvelope) error {
 	}
 }
 
-// StoreDesiredConfig writes desired configuration in later phases.
+// StoreDesiredConfig writes desired configuration to JetStream KV.
 func (c *Client) StoreDesiredConfig(ctx context.Context, rec DesiredConfigRecord) (*StoredDesiredConfig, error) {
-	_ = ctx
-	_ = rec
-
-	return nil, &Error{
-		Code:      CodeNotImplemented,
-		Op:        "store_desired_config",
-		Message:   "StoreDesiredConfig is not implemented in bootstrap phase",
-		Retryable: false,
+	stored, err := c.kv.StoreDesiredConfig(ctx, toKVRecord(rec))
+	if err != nil {
+		return nil, toPublicError(err)
 	}
+	return fromKVStored(stored), nil
 }
 
-// LoadDesiredConfig loads desired configuration in later phases.
+// LoadDesiredConfig loads desired configuration from JetStream KV.
 func (c *Client) LoadDesiredConfig(ctx context.Context, target string) (*StoredDesiredConfig, error) {
-	_ = ctx
-	_ = target
-
-	return nil, &Error{
-		Code:      CodeNotImplemented,
-		Op:        "load_desired_config",
-		Message:   "LoadDesiredConfig is not implemented in bootstrap phase",
-		Retryable: false,
+	stored, err := c.kv.LoadDesiredConfig(ctx, target)
+	if err != nil {
+		return nil, toPublicError(err)
 	}
+	return fromKVStored(stored), nil
 }
 
-// WatchDesiredConfig registers a desired-config watch in later phases.
+// WatchDesiredConfig registers a desired-config watch scoped to a single target.
 func (c *Client) WatchDesiredConfig(ctx context.Context, target string, handler DesiredConfigWatchHandler) (StopFunc, error) {
-	_ = ctx
-	_ = target
-	_ = handler
-
-	return nil, &Error{
-		Code:      CodeNotImplemented,
-		Op:        "watch_desired_config",
-		Message:   "WatchDesiredConfig is not implemented in bootstrap phase",
-		Retryable: false,
+	if handler == nil {
+		return nil, &Error{
+			Code:      CodeValidation,
+			Op:        "watch_desired_config",
+			Message:   "watch handler is required",
+			Retryable: false,
+		}
 	}
+
+	stop, err := c.kv.WatchDesiredConfig(ctx, target, func(watchCtx context.Context, stored kv.StoredDesiredConfig) error {
+		return handler(watchCtx, StoredDesiredConfig{
+			Record: DesiredConfigRecord{
+				Version:   stored.Record.Version,
+				RPCID:     stored.Record.RPCID,
+				Target:    stored.Record.Target,
+				UUID:      stored.Record.UUID,
+				Payload:   json.RawMessage(stored.Record.Payload),
+				Timestamp: stored.Record.Timestamp,
+			},
+			Bucket:    stored.Bucket,
+			Key:       stored.Key,
+			Revision:  stored.Revision,
+			CreatedAt: stored.CreatedAt,
+		})
+	})
+	if err != nil {
+		return nil, toPublicError(err)
+	}
+	return c.trackWatch(func() error {
+		return stop()
+	}), nil
 }
 
-// StartupReconcile loads latest desired state during recovery in later phases.
+// StartupReconcile loads latest desired state during recovery.
 func (c *Client) StartupReconcile(ctx context.Context, target string) (*StoredDesiredConfig, error) {
-	_ = ctx
-	_ = target
-
-	return nil, &Error{
-		Code:      CodeNotImplemented,
-		Op:        "startup_reconcile",
-		Message:   "StartupReconcile is not implemented in bootstrap phase",
-		Retryable: false,
-	}
+	return c.LoadDesiredConfig(ctx, target)
 }
 
 // RegisterConfigureHandler registers a configure notification handler.
@@ -313,5 +351,181 @@ func (c *Client) RegisterStatusHandler(target string, handler StatusHandler, opt
 		Op:        "register_status_handler",
 		Message:   "RegisterStatusHandler is not implemented in bootstrap phase",
 		Retryable: false,
+	}
+}
+
+func (c *Client) trackWatch(stop StopFunc) StopFunc {
+	id := atomic.AddUint64(&c.nextWatchID, 1)
+
+	c.mu.Lock()
+	c.watches[id] = stop
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() error {
+		var stopErr error
+		once.Do(func() {
+			c.mu.Lock()
+			stored := c.watches[id]
+			delete(c.watches, id)
+			c.mu.Unlock()
+			if stored != nil {
+				stopErr = stored()
+			}
+		})
+		return stopErr
+	}
+}
+
+func (c *Client) stopAllWatches() error {
+	c.mu.Lock()
+	stops := make([]StopFunc, 0, len(c.watches))
+	for id, stop := range c.watches {
+		_ = id
+		stops = append(stops, stop)
+	}
+	c.watches = make(map[uint64]StopFunc)
+	c.mu.Unlock()
+
+	var joined error
+	for _, stop := range stops {
+		if stop == nil {
+			continue
+		}
+		if err := stop(); err != nil {
+			if joined == nil {
+				joined = err
+			} else {
+				joined = errors.Join(joined, err)
+			}
+		}
+	}
+
+	return joined
+}
+
+func toSessionConfig(cfg Config) session.Config {
+	return session.Config{
+		AgentName: cfg.AgentName,
+		NATS: session.NATSConfig{
+			Servers:              append([]string(nil), cfg.NATS.Servers...),
+			ClientName:           cfg.NATS.ClientName,
+			CredentialsFile:      cfg.NATS.CredentialsFile,
+			NKeySeedFile:         cfg.NATS.NKeySeedFile,
+			UserJWTFile:          cfg.NATS.UserJWTFile,
+			Username:             cfg.NATS.Username,
+			Password:             cfg.NATS.Password,
+			Token:                cfg.NATS.Token,
+			ConnectTimeout:       cfg.NATS.ConnectTimeout,
+			RetryOnFailedConnect: cfg.NATS.RetryOnFailedConnect,
+			MaxReconnects:        cfg.NATS.MaxReconnects,
+			ReconnectWait:        cfg.NATS.ReconnectWait,
+			ReconnectBufSize:     cfg.NATS.ReconnectBufSize,
+			TLS:                  toSessionTLS(cfg.NATS.TLS),
+		},
+		JetStream: session.JetStreamConfig{
+			Domain:         cfg.JetStream.Domain,
+			APIPrefix:      cfg.JetStream.APIPrefix,
+			DefaultTimeout: cfg.JetStream.DefaultTimeout,
+		},
+		KV: session.KVConfig{
+			Bucket:           cfg.KV.Bucket,
+			KeyPattern:       cfg.KV.KeyPattern,
+			AutoCreateBucket: cfg.KV.AutoCreateBucket,
+			History:          cfg.KV.History,
+			TTL:              cfg.KV.TTL,
+			MaxValueSize:     cfg.KV.MaxValueSize,
+			Storage:          cfg.KV.Storage,
+			Replicas:         cfg.KV.Replicas,
+		},
+		Timeouts: session.TimeoutConfig{
+			PublishTimeout:   cfg.Timeouts.PublishTimeout,
+			SubscribeTimeout: cfg.Timeouts.SubscribeTimeout,
+			KVTimeout:        cfg.Timeouts.KVTimeout,
+			ShutdownTimeout:  cfg.Timeouts.ShutdownTimeout,
+			HandlerWarnAfter: cfg.Timeouts.HandlerWarnAfter,
+		},
+		Retry: session.RetryConfig{
+			PublishAttempts: cfg.Retry.PublishAttempts,
+			PublishBackoff:  cfg.Retry.PublishBackoff,
+		},
+	}
+}
+
+func toSessionTLS(cfg *TLSConfig) *session.TLSConfig {
+	if cfg == nil {
+		return nil
+	}
+	return &session.TLSConfig{
+		Enabled:            cfg.Enabled,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		CAFile:             cfg.CAFile,
+		CertFile:           cfg.CertFile,
+		KeyFile:            cfg.KeyFile,
+		ServerName:         cfg.ServerName,
+	}
+}
+
+func toKVRecord(rec DesiredConfigRecord) kv.DesiredConfigRecord {
+	return kv.DesiredConfigRecord{
+		Version:   rec.Version,
+		RPCID:     rec.RPCID,
+		Target:    rec.Target,
+		UUID:      rec.UUID,
+		Payload:   json.RawMessage(rec.Payload),
+		Timestamp: rec.Timestamp,
+	}
+}
+
+func fromKVStored(stored *kv.StoredDesiredConfig) *StoredDesiredConfig {
+	if stored == nil {
+		return nil
+	}
+	return &StoredDesiredConfig{
+		Record: DesiredConfigRecord{
+			Version:   stored.Record.Version,
+			RPCID:     stored.Record.RPCID,
+			Target:    stored.Record.Target,
+			UUID:      stored.Record.UUID,
+			Payload:   json.RawMessage(stored.Record.Payload),
+			Timestamp: stored.Record.Timestamp,
+		},
+		Bucket:    stored.Bucket,
+		Key:       stored.Key,
+		Revision:  stored.Revision,
+		CreatedAt: stored.CreatedAt,
+	}
+}
+
+func fromSessionHealth(snapshot session.HealthSnapshot) HealthSnapshot {
+	return HealthSnapshot{
+		State:                   ConnectionState(snapshot.State),
+		ConnectedURL:            snapshot.ConnectedURL,
+		JetStreamReady:          snapshot.JetStreamReady,
+		KVReady:                 snapshot.KVReady,
+		RegisteredSubscriptions: snapshot.RegisteredSubscriptions,
+		ActiveSubscriptions:     snapshot.ActiveSubscriptions,
+		LastError:               snapshot.LastError,
+	}
+}
+
+func toPublicError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var internal *runtimeerr.Error
+	if !errors.As(err, &internal) {
+		return err
+	}
+
+	return &Error{
+		Code:      Code(internal.Code),
+		Op:        internal.Op,
+		Subject:   internal.Subject,
+		Key:       internal.Key,
+		Message:   internal.Message,
+		Retryable: internal.Retryable,
+		Err:       internal.Err,
 	}
 }

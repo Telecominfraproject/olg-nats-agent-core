@@ -34,55 +34,59 @@ In simple words:
 
 ## Current status
 
-This repository currently includes **Phase 1 bootstrap + Phase 2 contract layer + Phase 3 messaging foundations**.
+This repository currently includes:
+
+- Phase 1 bootstrap and public API
+- Phase 2 contract, codec, and validation helpers
+- Phase 3 subject helpers and publish-path foundations
+- Phase 4 session, JetStream, KV, health, and recovery support
 
 Current code includes:
-- public config types
-- public client facade method signatures
-- standard envelope and storage models
-- typed public errors
-- logger and metrics interfaces
-- shared contract codec helpers (`internal/contract`)
-- shared contract validation helpers (`internal/contract`)
+- public config, model, error, logger, and metrics types
+- shared contract codec and validation helpers (`internal/contract`)
 - centralized subject generation and validation helpers (`internal/subjects`)
-- shared publish wrappers and configure store-then-notify groundwork (`internal/transport`)
+- runtime session management (`internal/session`)
+- JetStream and Key-Value setup for desired configuration storage
+- centralized timeout and retry defaults with override support
+- public lifecycle and state APIs:
+  - `Start(ctx)`
+  - `Close(ctx)`
+  - `Health()`
+- public desired-config APIs:
+  - `StoreDesiredConfig(...)`
+  - `LoadDesiredConfig(...)`
+  - `WatchDesiredConfig(...)`
+  - `StartupReconcile(...)`
 
-Full runtime session/JetStream/KV wiring, subscribe/handler runtime flow,
-reconnect restoration, and public `agentcore.Client` method wiring are
-intentionally deferred to later phases.
+Still deferred to later phases:
+- submit/publish wrappers for configure, action, result, and status
+- subscribe wrappers and handler registration
+- reconnect-safe subscription restore
+- receive-side result correlation helpers
+- integration examples / full quick-start flows
 
 ---
 
-## What this library does
+## What this library does today
 
-The intended end-state of this library is to help agents:
-
-This section describes the target design and is not fully implemented in the
-current Phase 1 + Phase 2 + Phase 3 foundation state.
-
-- connect to NATS
-- reconnect after temporary disconnects
-- create and use JetStream
+The library currently helps agents:
+- start and close a NATS-backed runtime session
+- expose connection/session health to the owning agent
+- create and use JetStream through the shared session layer
+- bind to or create the desired-config KV bucket
 - store desired configuration in JetStream KV
-- publish configure notifications
-- publish action commands
-- publish result and status messages
-- subscribe to message subjects
-- restore subscriptions after reconnect
+- load desired configuration from JetStream KV
+- optionally watch desired configuration updates
+- retrieve the latest desired configuration for startup reconciliation
 
----
+## What is planned next
 
-## What this library does not do
-
-This library does **not** implement workload-specific or platform-specific logic.
-
-Examples of things that should stay outside this library:
-
-- VyOS configuration translation
-- host reboot/script execution
-- trace or remote terminal implementation
-- cloud-side business validation
-- local apply / rollback logic
+Later phases are intended to add:
+- configure/action submit wrappers
+- result/status publish wrappers
+- subscribe wrappers and handler registration
+- reconnect-safe subscription restoration
+- receive-side result correlation helpers
 
 ---
 
@@ -103,8 +107,11 @@ The library is designed around the idea that agents use shared transport/state h
 
 ## Basic communication model
 
-The flows below describe the target design. They are not fully implemented in
-the current Phase 1 + Phase 2 + Phase 3 foundation state.
+The flows below describe the intended library communication model.
+
+As of the current implementation:
+- session startup, JetStream/KV access, desired-config store/load/watch, and startup reconciliation are implemented
+- configure/action submit wrappers and receive-side handler flows are still planned for later phases
 
 ### Configure flow
 
@@ -154,7 +161,51 @@ The library uses KV to hold the current desired configuration for a target.
 
 ---
 
+## Currently usable public API
+
+The main public APIs currently usable by an owning agent are:
+
+- `New(...)`
+- `Start(ctx)`
+- `Close(ctx)`
+- `Health()`
+- `StoreDesiredConfig(...)`
+- `LoadDesiredConfig(...)`
+- `WatchDesiredConfig(...)`
+- `StartupReconcile(...)`
+
+---
+
+### Current startup limitation
+
+`RetryOnFailedConnect` is not supported by the current synchronous `Start(ctx)` behavior.
+
+If enabled, `Start(ctx)` returns a validation error instead of entering a partially connected retrying startup mode.
+
+---
+
 ## Notes
 
 For the normative design contract and exact behavior, see `SPEC.md`.
 SubmitConfigure failure semantics are defined in `SPEC.md` section `6.4`.
+---
+
+## Build / toolchain note
+
+This repository currently targets Go 1.25.x.
+
+## Testing
+
+This repository includes real-server integration tests for the currently
+implemented Phase 4 runtime/session/KV/recovery behavior.
+
+For local integration runs, `nats-server` must be installed and available in
+`PATH`.
+
+Unit tests:
+
+`go test ./...`
+
+Integration tests:
+
+`go test -count=1 -v -tags=integration ./tests/integration/...`

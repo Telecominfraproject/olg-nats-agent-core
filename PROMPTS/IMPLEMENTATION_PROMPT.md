@@ -22,6 +22,13 @@ ARCHITECTURE
   - internal/observe
   - internal/errors
 
+IMPLEMENTATION STRUCTURE RULE
+- The public `agentcore` package is the facade and public API surface only.
+- Concrete runtime, session, KV, transport, and other implementation behavior must live in the appropriate `internal/...` packages.
+- Public client methods must wire to those internal packages rather than re-implementing the same logic in `agentcore`.
+- Do not duplicate runtime logic across both `agentcore` and `internal/...`.
+- If a phase introduces a new internal package, use that package as the single implementation source of truth and keep `agentcore` limited to facade wiring.
+
 REQUIRED BEHAVIOR
 - Connect to configured NATS servers with daemon-friendly reconnect policy.
 - Build JetStream handle with jetstream.New(nc).

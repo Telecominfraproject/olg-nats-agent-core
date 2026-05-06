@@ -22,12 +22,12 @@ type testMetrics struct {
 	states       []string
 }
 
-func (m *testMetrics) IncConnect(result string)                           { m.connectCalls++ }
-func (m *testMetrics) SetConnectionState(state string)                    { m.states = append(m.states, state) }
-func (m *testMetrics) IncPublish(kind, subject, result string)            {}
+func (m *testMetrics) IncConnect(result string)                                    { m.connectCalls++ }
+func (m *testMetrics) SetConnectionState(state string)                             { m.states = append(m.states, state) }
+func (m *testMetrics) IncPublish(kind, subject, result string)                     {}
 func (m *testMetrics) ObservePublishLatency(kind, subject string, d time.Duration) {}
-func (m *testMetrics) IncSubscribe(kind, subject, result string)          {}
-func (m *testMetrics) IncKV(op, result string)                            {}
+func (m *testMetrics) IncSubscribe(kind, subject, result string)                   {}
+func (m *testMetrics) IncKV(op, result string)                                     {}
 
 func testConfig() Config {
 	return Config{
@@ -98,6 +98,24 @@ func requireNotImplementedError(t *testing.T, err error, wantOp string) {
 	if got.Op != wantOp {
 		t.Fatalf("expected error op %q, got %q", wantOp, got.Op)
 	}
+}
+
+func requireErrorCode(t *testing.T, err error, wantCode Code) *Error {
+	t.Helper()
+
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+
+	var got *Error
+	if !errors.As(err, &got) {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if got.Code != wantCode {
+		t.Fatalf("expected error code %q, got %q", wantCode, got.Code)
+	}
+
+	return got
 }
 
 /*
@@ -389,74 +407,79 @@ func TestWithClockRejectsNilFunction(t *testing.T) {
 /*
 TC-CLIENT-005
 Type: Negative
-Title: Start returns bootstrap not-implemented error
+Title: Start rejects canceled context with typed connection error
 Summary:
-Verifies that Start(...) remains a Phase 1 stub and returns the expected typed
-not-implemented error while updating the health state to connecting.
+Verifies that Start(...) fails fast when called with a canceled context and
+returns the expected typed connection failure.
 
 Validates:
   - Start(...) returns a non-nil *Error
-  - error code is CodeNotImplemented
+  - error code is CodeConnectionFailed
   - error op is start
-  - health state transitions to StateConnecting
+  - health state remains StateNew after fast-fail
 */
-func TestStartReturnsNotImplementedAndMovesHealthToConnecting(t *testing.T) {
+func TestStartReturnsConnectionFailedOnCanceledContext(t *testing.T) {
 	client, err := New(testConfig())
 	if err != nil {
 		t.Fatalf("New returned unexpected error: %v", err)
 	}
 
-	err = client.Start(context.Background())
-	requireNotImplementedError(t, err, "start")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	if got := client.Health().State; got != StateConnecting {
-		t.Fatalf("expected health state %q, got %q", StateConnecting, got)
+	err = client.Start(ctx)
+	got := requireErrorCode(t, err, CodeConnectionFailed)
+	if got.Op != "start" {
+		t.Fatalf("expected error op %q, got %q", "start", got.Op)
+	}
+
+	if got := client.Health().State; got != StateNew {
+		t.Fatalf("expected health state %q, got %q", StateNew, got)
 	}
 }
 
 /*
 TC-CLIENT-006
 Type: Negative
-Title: Close returns bootstrap not-implemented error
+Title: Close is safe before Start and transitions health to closed
 Summary:
-Verifies that Close(...) remains a Phase 1 stub and returns the expected typed
-not-implemented error while updating the health state to draining.
+Verifies that Close(...) is idempotent and safe before Start, and updates
+health to StateClosed.
 
 Validates:
-  - Close(...) returns a non-nil *Error
-  - error code is CodeNotImplemented
-  - error op is close
-  - health state transitions to StateDraining
+  - Close(...) returns nil error
+  - health state transitions to StateClosed
 */
-func TestCloseReturnsNotImplementedAndMovesHealthToDraining(t *testing.T) {
+func TestCloseBeforeStartMovesHealthToClosed(t *testing.T) {
 	client, err := New(testConfig())
 	if err != nil {
 		t.Fatalf("New returned unexpected error: %v", err)
 	}
 
 	err = client.Close(context.Background())
-	requireNotImplementedError(t, err, "close")
+	if err != nil {
+		t.Fatalf("expected nil close error, got %v", err)
+	}
 
-	if got := client.Health().State; got != StateDraining {
-		t.Fatalf("expected health state %q, got %q", StateDraining, got)
+	if got := client.Health().State; got != StateClosed {
+		t.Fatalf("expected health state %q, got %q", StateClosed, got)
 	}
 }
 
 /*
 TC-CLIENT-007
 Type: Negative
-Title: Bootstrap stubs return CodeNotImplemented across deferred APIs
+Title: Phase 4 APIs return disconnected until runtime is started
 Summary:
-Verifies that the Phase 1 APIs intentionally deferred to later transport/runtime
-phases return consistent typed not-implemented errors and no success value.
+Verifies that runtime-backed desired-config APIs fail clearly with
+CodeDisconnected before Start, while remaining deferred APIs still return
+CodeNotImplemented.
 
 Validates:
-  - each deferred public API returns a non-nil *Error
-  - each returned *Error has CodeNotImplemented
-  - each error carries the correct operation name
-  - methods that return values do not return success payloads in Phase 1
+  - runtime-backed desired-config APIs return CodeDisconnected when not started
+  - deferred APIs still return CodeNotImplemented with expected operation names
 */
-func TestBootstrapStubMethodsReturnCodeNotImplemented(t *testing.T) {
+func TestPhase4RuntimeAndDeferredMethodsReturnExpectedErrors(t *testing.T) {
 	client, err := New(testConfig())
 	if err != nil {
 		t.Fatalf("New returned unexpected error: %v", err)
@@ -506,7 +529,62 @@ func TestBootstrapStubMethodsReturnCodeNotImplemented(t *testing.T) {
 		Timestamp: now,
 	}
 
-	tests := []struct {
+	runtimeTests := []struct {
+		name string
+		call func(*Client) error
+	}{
+		{
+			name: "StoreDesiredConfig",
+			call: func(c *Client) error {
+				stored, err := c.StoreDesiredConfig(context.Background(), record)
+				if stored != nil {
+					t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
+				}
+				return err
+			},
+		},
+		{
+			name: "LoadDesiredConfig",
+			call: func(c *Client) error {
+				stored, err := c.LoadDesiredConfig(context.Background(), "vyos")
+				if stored != nil {
+					t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
+				}
+				return err
+			},
+		},
+		{
+			name: "WatchDesiredConfig",
+			call: func(c *Client) error {
+				stop, err := c.WatchDesiredConfig(context.Background(), "vyos", func(context.Context, StoredDesiredConfig) error {
+					return nil
+				})
+				if stop != nil {
+					t.Fatal("expected nil StopFunc when runtime is disconnected")
+				}
+				return err
+			},
+		},
+		{
+			name: "StartupReconcile",
+			call: func(c *Client) error {
+				stored, err := c.StartupReconcile(context.Background(), "vyos")
+				if stored != nil {
+					t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
+				}
+				return err
+			},
+		},
+	}
+
+	for _, tc := range runtimeTests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call(client)
+			requireErrorCode(t, err, CodeDisconnected)
+		})
+	}
+
+	deferredTests := []struct {
 		name string
 		op   string
 		call func(*Client) error
@@ -548,52 +626,6 @@ func TestBootstrapStubMethodsReturnCodeNotImplemented(t *testing.T) {
 			},
 		},
 		{
-			name: "StoreDesiredConfig",
-			op:   "store_desired_config",
-			call: func(c *Client) error {
-				stored, err := c.StoreDesiredConfig(context.Background(), record)
-				if stored != nil {
-					t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
-				}
-				return err
-			},
-		},
-		{
-			name: "LoadDesiredConfig",
-			op:   "load_desired_config",
-			call: func(c *Client) error {
-				stored, err := c.LoadDesiredConfig(context.Background(), "vyos")
-				if stored != nil {
-					t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
-				}
-				return err
-			},
-		},
-		{
-			name: "WatchDesiredConfig",
-			op:   "watch_desired_config",
-			call: func(c *Client) error {
-				stop, err := c.WatchDesiredConfig(context.Background(), "vyos", func(context.Context, StoredDesiredConfig) error {
-					return nil
-				})
-				if stop != nil {
-					t.Fatal("expected nil StopFunc for bootstrap watch")
-				}
-				return err
-			},
-		},
-		{
-			name: "StartupReconcile",
-			op:   "startup_reconcile",
-			call: func(c *Client) error {
-				stored, err := c.StartupReconcile(context.Background(), "vyos")
-				if stored != nil {
-					t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
-				}
-				return err
-			},
-		},
-		{
 			name: "RegisterConfigureHandler",
 			op:   "register_configure_handler",
 			call: func(c *Client) error {
@@ -623,7 +655,7 @@ func TestBootstrapStubMethodsReturnCodeNotImplemented(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
+	for _, tc := range deferredTests {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.call(client)
 			requireNotImplementedError(t, err, tc.op)
@@ -656,5 +688,66 @@ func TestNewToleratesNilOption(t *testing.T) {
 
 	if got := client.Health().State; got != StateNew {
 		t.Fatalf("expected initial health state %q, got %q", StateNew, got)
+	}
+}
+
+/*
+TC-CLIENT-009
+Type: Negative
+Title: WatchDesiredConfig rejects a nil handler
+Summary:
+Verifies that WatchDesiredConfig(...) fails fast when called with a nil
+DesiredConfigWatchHandler. The public facade should reject the call before any
+watch is created or delegated to the runtime KV layer.
+
+Validates:
+  - WatchDesiredConfig(ctx, target, nil) returns a non-nil error
+  - returned StopFunc is nil
+  - error code is CodeValidation
+  - error op is watch_desired_config
+*/
+func TestWatchDesiredConfigRejectsNilHandler(t *testing.T) {
+	client, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	stop, err := client.WatchDesiredConfig(context.Background(), "vyos", nil)
+	if stop != nil {
+		t.Fatalf("expected nil StopFunc, got non-nil")
+	}
+
+	got := requireErrorCode(t, err, CodeValidation)
+	if got.Op != "watch_desired_config" {
+		t.Fatalf("expected error op %q, got %q", "watch_desired_config", got.Op)
+	}
+}
+
+/*
+TC-CLIENT-010
+Type: Negative
+Title: StartupReconcile delegates to desired-config load path
+Summary:
+Verifies that StartupReconcile(...) uses the same runtime-backed desired-config
+load behavior as LoadDesiredConfig(...) before Start.
+
+Validates:
+  - StartupReconcile returns CodeDisconnected before Start
+  - returned error op matches load_desired_config delegation path
+*/
+func TestStartupReconcileDelegatesToLoadDesiredConfigPath(t *testing.T) {
+	client, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	stored, err := client.StartupReconcile(context.Background(), "vyos")
+	if stored != nil {
+		t.Fatalf("expected nil StoredDesiredConfig, got %#v", stored)
+	}
+
+	got := requireErrorCode(t, err, CodeDisconnected)
+	if got.Op != "key_value" {
+		t.Fatalf("expected error op %q, got %q", "key_value", got.Op)
 	}
 }
