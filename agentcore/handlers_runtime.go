@@ -208,7 +208,7 @@ func (c *Client) activateAllRegisteredSubscriptions(op string) error {
 	records := c.subscriptions.ListActivations()
 	var joined error
 	for _, rec := range records {
-		if err := c.activateRecordLocked(rec, false, op); err != nil {
+		if err := c.activateRecordLocked(rec, false, op, true); err != nil {
 			joined = errors.Join(joined, err)
 		}
 	}
@@ -221,12 +221,90 @@ func (c *Client) restoreAllRegisteredSubscriptions() error {
 	defer c.subMu.Unlock()
 
 	records := c.subscriptions.RestoreRecords()
+	if len(records) == 0 {
+		return nil
+	}
+
+	type tempSub struct {
+		rec registry.ActivationRecord
+		sub *nats.Subscription
+	}
+	var createdSubs []tempSub
 	var joined error
+
 	for _, rec := range records {
-		if err := c.activateRecordLocked(rec, true, "restore_subscriptions"); err != nil {
+		if rec.Active && rec.ActiveSub != nil {
+			c.cleanupSubscription(rec.ActiveSub, "restore_subscriptions", rec.ID, rec.Subject, "failed to unsubscribe stale subscription before restore")
+		}
+
+		sub, err := c.createSubscriptionForRecord(rec, "restore_subscriptions", false)
+		if err != nil {
+			c.subscriptions.MarkInactive(rec.ID, err)
 			joined = errors.Join(joined, err)
+			c.logError("subscription restore failed to create NATS subscription", "registration_id", rec.ID, "subject", rec.Subject, "error", err)
+			if c.options.metrics != nil {
+				c.options.metrics.IncSubscribe(string(rec.Kind), rec.Subject, "failure")
+			}
+			continue
+		}
+
+		createdSubs = append(createdSubs, tempSub{rec: rec, sub: sub})
+	}
+
+	if len(createdSubs) == 0 {
+		c.syncSubscriptionHealth()
+		return joined
+	}
+
+	nc, err := c.session.Connection()
+	if err != nil {
+		for _, ts := range createdSubs {
+			_ = ts.sub.Unsubscribe()
+			c.subscriptions.MarkInactive(ts.rec.ID, err)
+		}
+		joined = errors.Join(joined, toPublicError(err))
+		c.syncSubscriptionHealth()
+		return joined
+	}
+
+	flushTimeout := c.session.EffectiveConfig().Timeouts.SubscribeTimeout
+	if err := nc.FlushTimeout(flushTimeout); err != nil {
+		flushErr := &Error{
+			Code:      CodeSubscribeFailed,
+			Op:        "restore_subscriptions_batch_flush",
+			Message:   "batch subscribe readiness flush failed",
+			Retryable: true,
+			Err:       err,
+		}
+		for _, ts := range createdSubs {
+			_ = ts.sub.Unsubscribe()
+			c.subscriptions.MarkInactive(ts.rec.ID, flushErr)
+		}
+		joined = errors.Join(joined, flushErr)
+		c.syncSubscriptionHealth()
+		return joined
+	}
+
+	for _, ts := range createdSubs {
+		var staleSub *nats.Subscription
+		_, exists := c.subscriptions.GetActivationRecord(ts.rec.ID)
+		if exists {
+			staleSub = c.subscriptions.MarkActive(ts.rec.ID, ts.sub)
+		}
+		if staleSub != nil {
+			_ = staleSub.Unsubscribe()
+		}
+		if !exists {
+			_ = ts.sub.Unsubscribe()
+			continue
+		}
+
+		c.logInfo("subscription activated (batch)", "operation", "restore_subscriptions", "registration_id", ts.rec.ID, "subject", ts.rec.Subject, "kind", string(ts.rec.Kind), "queue_group", ts.rec.QueueGroup)
+		if c.options.metrics != nil {
+			c.options.metrics.IncSubscribe(string(ts.rec.Kind), ts.rec.Subject, "success")
 		}
 	}
+
 	c.syncSubscriptionHealth()
 	return joined
 }
@@ -236,7 +314,7 @@ func (c *Client) activateRegisteredSubscriptionByIDLocked(id string, force bool,
 	if !ok {
 		return nil
 	}
-	return c.activateRecordLocked(rec, force, op)
+	return c.activateRecordLocked(rec, force, op, true)
 }
 
 func (c *Client) activateRegisteredSubscriptionByID(id string, force bool, op string) error {
@@ -262,7 +340,7 @@ func (c *Client) activationRecordByID(id string, force bool) (registry.Activatio
 	return c.activationRecordByIDLocked(id, force)
 }
 
-func (c *Client) activateRecordLocked(rec registry.ActivationRecord, force bool, op string) error {
+func (c *Client) activateRecordLocked(rec registry.ActivationRecord, force bool, op string, flush bool) error {
 	if rec.Active && !force {
 		return nil
 	}
@@ -271,7 +349,7 @@ func (c *Client) activateRecordLocked(rec registry.ActivationRecord, force bool,
 		c.cleanupSubscription(rec.ActiveSub, op, rec.ID, rec.Subject, "failed to unsubscribe stale subscription before restore")
 	}
 
-	sub, err := c.createSubscriptionForRecord(rec, op)
+	sub, err := c.createSubscriptionForRecord(rec, op, flush)
 	if err != nil {
 		c.subscriptions.MarkInactive(rec.ID, err)
 
@@ -310,19 +388,19 @@ func (c *Client) activateRecordLocked(rec registry.ActivationRecord, force bool,
 func (c *Client) activateRecord(rec registry.ActivationRecord, force bool, op string) error {
 	c.subMu.Lock()
 	defer c.subMu.Unlock()
-	return c.activateRecordLocked(rec, force, op)
+	return c.activateRecordLocked(rec, force, op, true)
 }
 
-func (c *Client) createSubscriptionForRecord(rec registry.ActivationRecord, op string) (*nats.Subscription, error) {
+func (c *Client) createSubscriptionForRecord(rec registry.ActivationRecord, op string, flush bool) (*nats.Subscription, error) {
 	switch rec.Kind {
 	case registry.KindConfigure:
-		return c.subscribeConfigure(rec.Subject, rec.QueueGroup, rec.Callback)
+		return c.subscribeConfigure(rec.Subject, rec.QueueGroup, rec.Callback, flush)
 	case registry.KindAction:
-		return c.subscribeAction(rec.Subject, rec.QueueGroup, rec.Callback)
+		return c.subscribeAction(rec.Subject, rec.QueueGroup, rec.Callback, flush)
 	case registry.KindResult:
-		return c.subscribeResult(rec.Subject, rec.QueueGroup, rec.Callback)
+		return c.subscribeResult(rec.Subject, rec.QueueGroup, rec.Callback, flush)
 	case registry.KindStatus:
-		return c.subscribeStatus(rec.Subject, rec.QueueGroup, rec.Callback)
+		return c.subscribeStatus(rec.Subject, rec.QueueGroup, rec.Callback, flush)
 	default:
 		return nil, &Error{
 			Code:      CodeValidation,
@@ -441,23 +519,23 @@ func (c *Client) syncSubscriptionHealth() {
 	c.session.SetSubscriptionCounts(registered, active)
 }
 
-func (c *Client) subscribeConfigure(subject, queueGroup string, callback nats.MsgHandler) (*nats.Subscription, error) {
-	return c.subscribeInternal("subscribe_configure", string(registry.KindConfigure), subject, queueGroup, callback)
+func (c *Client) subscribeConfigure(subject, queueGroup string, callback nats.MsgHandler, flush bool) (*nats.Subscription, error) {
+	return c.subscribeInternal("subscribe_configure", string(registry.KindConfigure), subject, queueGroup, callback, flush)
 }
 
-func (c *Client) subscribeAction(subject, queueGroup string, callback nats.MsgHandler) (*nats.Subscription, error) {
-	return c.subscribeInternal("subscribe_action", string(registry.KindAction), subject, queueGroup, callback)
+func (c *Client) subscribeAction(subject, queueGroup string, callback nats.MsgHandler, flush bool) (*nats.Subscription, error) {
+	return c.subscribeInternal("subscribe_action", string(registry.KindAction), subject, queueGroup, callback, flush)
 }
 
-func (c *Client) subscribeResult(subject, queueGroup string, callback nats.MsgHandler) (*nats.Subscription, error) {
-	return c.subscribeInternal("subscribe_result", string(registry.KindResult), subject, queueGroup, callback)
+func (c *Client) subscribeResult(subject, queueGroup string, callback nats.MsgHandler, flush bool) (*nats.Subscription, error) {
+	return c.subscribeInternal("subscribe_result", string(registry.KindResult), subject, queueGroup, callback, flush)
 }
 
-func (c *Client) subscribeStatus(subject, queueGroup string, callback nats.MsgHandler) (*nats.Subscription, error) {
-	return c.subscribeInternal("subscribe_status", string(registry.KindStatus), subject, queueGroup, callback)
+func (c *Client) subscribeStatus(subject, queueGroup string, callback nats.MsgHandler, flush bool) (*nats.Subscription, error) {
+	return c.subscribeInternal("subscribe_status", string(registry.KindStatus), subject, queueGroup, callback, flush)
 }
 
-func (c *Client) subscribeInternal(op, kind, subject, queueGroup string, callback nats.MsgHandler) (*nats.Subscription, error) {
+func (c *Client) subscribeInternal(op, kind, subject, queueGroup string, callback nats.MsgHandler, flush bool) (*nats.Subscription, error) {
 	if callback == nil {
 		return nil, validationError(op, "subscription callback is required")
 	}
@@ -487,15 +565,17 @@ func (c *Client) subscribeInternal(op, kind, subject, queueGroup string, callbac
 		}
 	}
 
-	if err := nc.FlushTimeout(c.session.EffectiveConfig().Timeouts.SubscribeTimeout); err != nil {
-		_ = sub.Unsubscribe()
-		return nil, &Error{
-			Code:      CodeSubscribeFailed,
-			Op:        op,
-			Subject:   subject,
-			Message:   "subscribe readiness flush failed",
-			Retryable: true,
-			Err:       err,
+	if flush {
+		if err := nc.FlushTimeout(c.session.EffectiveConfig().Timeouts.SubscribeTimeout); err != nil {
+			_ = sub.Unsubscribe()
+			return nil, &Error{
+				Code:      CodeSubscribeFailed,
+				Op:        op,
+				Subject:   subject,
+				Message:   "subscribe readiness flush failed",
+				Retryable: true,
+				Err:       err,
+			}
 		}
 	}
 
