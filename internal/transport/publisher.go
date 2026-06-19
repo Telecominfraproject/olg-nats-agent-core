@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"log"
 	"strings"
 	"time"
 
@@ -24,6 +25,8 @@ type PublishMetrics interface {
 type Publisher struct {
 	conn           ConnectionProvider
 	publishTimeout func() time.Duration
+	attempts       func() int
+	backoff        func() time.Duration
 	metrics        PublishMetrics
 	publishFn      func(*nats.Conn, string, []byte) error
 	flushFn        func(*nats.Conn, context.Context) error
@@ -33,6 +36,8 @@ type Publisher struct {
 func NewPublisher(
 	conn ConnectionProvider,
 	publishTimeout func() time.Duration,
+	attempts func() int,
+	backoff func() time.Duration,
 	metrics PublishMetrics,
 ) (*Publisher, error) {
 	if conn == nil {
@@ -46,10 +51,18 @@ func NewPublisher(
 	if publishTimeout == nil {
 		publishTimeout = func() time.Duration { return 0 }
 	}
+	if attempts == nil {
+		attempts = func() int { return 1 }
+	}
+	if backoff == nil {
+		backoff = func() time.Duration { return 0 }
+	}
 
 	return &Publisher{
 		conn:           conn,
 		publishTimeout: publishTimeout,
+		attempts:       attempts,
+		backoff:        backoff,
 		metrics:        metrics,
 		publishFn: func(nc *nats.Conn, subject string, payload []byte) error {
 			return nc.Publish(subject, payload)
@@ -102,12 +115,62 @@ func (p *Publisher) Publish(ctx context.Context, op, kind, subject string, paylo
 		}
 	}
 
+	attempts := p.attempts()
+	if attempts <= 0 {
+		attempts = 1
+	}
+	backoff := p.backoff()
+
+	started := time.Now()
+	var lastErr error
+
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return &runtimeerr.Error{
+				Code:      runtimeerr.CodeValidation,
+				Op:        op,
+				Subject:   subject,
+				Message:   "context is not usable",
+				Retryable: false,
+				Err:       err,
+			}
+		}
+
+		err := p.publishOnce(ctx, op, kind, subject, payload)
+		if err == nil {
+			p.incPublish(kind, subject, "success")
+			p.observePublishLatency(kind, subject, time.Since(started))
+			return nil
+		}
+
+		lastErr = err
+		log.Printf("publish attempt %d/%d failed: %v", i+1, attempts, err)
+
+		if i < attempts-1 {
+			select {
+			case <-ctx.Done():
+				return &runtimeerr.Error{
+					Code:      runtimeerr.CodePublishFailed,
+					Op:        op,
+					Subject:   subject,
+					Message:   "publish aborted due to context cancellation",
+					Retryable: false,
+					Err:       ctx.Err(),
+				}
+			case <-time.After(backoff):
+			}
+		}
+	}
+
+	return lastErr
+}
+
+func (p *Publisher) publishOnce(ctx context.Context, op, kind, subject string, payload []byte) error {
 	nc, err := p.conn.Connection()
 	if err != nil {
 		return err
 	}
 
-	started := time.Now()
 	if err := p.publishFn(nc, subject, payload); err != nil {
 		p.incPublish(kind, subject, "failure")
 		return &runtimeerr.Error{
@@ -135,8 +198,6 @@ func (p *Publisher) Publish(ctx context.Context, op, kind, subject string, paylo
 		}
 	}
 
-	p.incPublish(kind, subject, "success")
-	p.observePublishLatency(kind, subject, time.Since(started))
 	return nil
 }
 

@@ -189,6 +189,12 @@ func New(cfg Config, opts ...Option) (*Client, error) {
 		func() time.Duration {
 			return runtime.EffectiveConfig().Timeouts.PublishTimeout
 		},
+		func() int {
+			return runtime.EffectiveConfig().Retry.PublishAttempts
+		},
+		func() time.Duration {
+			return runtime.EffectiveConfig().Retry.PublishBackoff
+		},
 		options.metrics,
 	)
 	if err != nil {
