@@ -10,11 +10,12 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/Telecominfraproject/olg-nats-agent-core/agentcore"
+	"github.com/nats-io/nats.go"
 )
 
 type testNATSServer struct {
@@ -25,7 +26,7 @@ type testNATSServer struct {
 	port     int
 	storeDir string
 	cmd      *exec.Cmd
-	logs     *bytes.Buffer
+	logs     *safeBuffer
 }
 
 func startTestNATSServer(t *testing.T) *testNATSServer {
@@ -38,7 +39,7 @@ func startTestNATSServer(t *testing.T) *testNATSServer {
 
 	port := freeTCPPort(t)
 	storeDir := t.TempDir()
-	logBuf := &bytes.Buffer{}
+	logBuf := &safeBuffer{}
 
 	cmd := exec.Command(bin,
 		"-js",
@@ -176,4 +177,21 @@ func newIntegrationConfig(serverURL, bucket string, autoCreate bool) agentcore.C
 
 func uniqueName(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/Telecominfraproject/olg-nats-agent-core/agentcore"
+	"github.com/nats-io/nats.go"
 )
 
 /*
@@ -657,4 +657,3 @@ func TestIntegrationConcurrentRegisterAndReconnect(t *testing.T) {
 		}
 	}
 }
-

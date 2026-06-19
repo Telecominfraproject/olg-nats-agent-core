@@ -596,4 +596,3 @@ func waitForClientKVConnected(client *agentcore.Client, timeout time.Duration) e
 	}
 	return context.DeadlineExceeded
 }
-
