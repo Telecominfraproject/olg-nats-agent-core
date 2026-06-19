@@ -745,3 +745,90 @@ func TestStartupReconcileDelegatesToLoadDesiredConfigPath(t *testing.T) {
 		t.Fatalf("expected error op %q, got %q", "key_value", got.Op)
 	}
 }
+
+/*
+TC-CLIENT-011
+Type: Negative
+Title: Close returns unified CodeShutdown error containing joined failures
+Summary:
+Verifies that Client.Close(...) combines multiple internal cleanup failures
+(deactivating subscriptions, stopping watches, closing session) using errors.Join
+and wraps them in a single unified agentcore.Error with CodeShutdown.
+*/
+func TestClientCloseUnifiesErrors(t *testing.T) {
+	client, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	mockSubErr := errors.New("deactivate-subs-fail")
+	mockSessionErr := errors.New("close-session-fail")
+
+	client.deactivateAllSubscriptionsFn = func(op string) error {
+		return mockSubErr
+	}
+	client.closeSessionFn = func(ctx context.Context) error {
+		return mockSessionErr
+	}
+
+	err = client.Close(context.Background())
+	if err == nil {
+		t.Fatal("expected non-nil error from Close")
+	}
+
+	got := requireErrorCode(t, err, CodeShutdown)
+	if got.Op != "close" {
+		t.Fatalf("expected error op %q, got %q", "close", got.Op)
+	}
+	if got.Message != "client close operation encountered errors" {
+		t.Fatalf("unexpected error message: %q", got.Message)
+	}
+	if got.Retryable != false {
+		t.Fatal("expected Retryable to be false")
+	}
+
+	// Verify that both mock errors are wrapped and discoverable via errors.Is/As or Unwrap
+	unwrapped := got.Unwrap()
+	if unwrapped == nil {
+		t.Fatal("expected unwrapped error to be non-nil")
+	}
+
+	if !errors.Is(unwrapped, mockSubErr) {
+		t.Fatalf("expected unwrapped error to contain %v", mockSubErr)
+	}
+	if !errors.Is(unwrapped, mockSessionErr) {
+		t.Fatalf("expected unwrapped error to contain %v", mockSessionErr)
+	}
+}
+
+/*
+TC-CLIENT-012
+Type: Negative
+Title: Close returns unified CodeShutdown even when only one internal cleanup operation fails
+Summary:
+Verifies that Client.Close(...) returns a unified agentcore.Error with CodeShutdown even when only a single cleanup operation fails.
+*/
+func TestClientCloseUnifiesSingleError(t *testing.T) {
+	client, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	mockSubErr := errors.New("deactivate-subs-fail")
+	client.deactivateAllSubscriptionsFn = func(op string) error {
+		return mockSubErr
+	}
+
+	err = client.Close(context.Background())
+	if err == nil {
+		t.Fatal("expected non-nil error from Close")
+	}
+
+	got := requireErrorCode(t, err, CodeShutdown)
+	if got.Op != "close" {
+		t.Fatalf("expected error op %q, got %q", "close", got.Op)
+	}
+	if !errors.Is(got.Unwrap(), mockSubErr) {
+		t.Fatalf("expected unwrapped error to contain %v", mockSubErr)
+	}
+}

@@ -120,6 +120,7 @@ type Client struct {
 	activateAllSubscriptionsFn   func(string) error
 	deactivateAllSubscriptionsFn func(string) error
 	storeDesiredConfigFn         func(context.Context, DesiredConfigRecord) (*StoredDesiredConfig, error)
+	closeSessionFn               func(context.Context) error
 }
 
 type publisher interface {
@@ -247,31 +248,19 @@ func (c *Client) Close(ctx context.Context) error {
 	c.cancelHandlerContext()
 	subErr := c.deactivateAllSubscriptionsWithOp("close")
 	watchErr := c.stopAllWatches()
-	sessionErr := toPublicError(c.session.Close(ctx))
+	sessionErr := toPublicError(c.closeSession(ctx))
 
-	if subErr != nil && watchErr == nil && sessionErr == nil {
-		return subErr
-	}
-	if watchErr != nil && sessionErr == nil && subErr == nil {
-		return &Error{
-			Code:      CodeShutdown,
-			Op:        "close_stop_watches",
-			Message:   "failed to stop one or more desired-config watches",
-			Retryable: false,
-			Err:       watchErr,
-		}
-	}
 	if subErr != nil || watchErr != nil || sessionErr != nil {
 		joined := errors.Join(subErr, watchErr, sessionErr)
 		return &Error{
 			Code:      CodeShutdown,
 			Op:        "close",
-			Message:   "close failed with subscription, watch-stop, or session shutdown errors",
-			Retryable: true,
+			Message:   "client close operation encountered errors",
+			Retryable: false,
 			Err:       joined,
 		}
 	}
-	return sessionErr
+	return nil
 }
 
 func (c *Client) startSession(ctx context.Context) error {
@@ -279,6 +268,13 @@ func (c *Client) startSession(ctx context.Context) error {
 		return c.startSessionFn(ctx)
 	}
 	return toPublicError(c.session.Start(ctx))
+}
+
+func (c *Client) closeSession(ctx context.Context) error {
+	if c.closeSessionFn != nil {
+		return c.closeSessionFn(ctx)
+	}
+	return c.session.Close(ctx)
 }
 
 func (c *Client) activateAllSubscriptions(op string) error {
