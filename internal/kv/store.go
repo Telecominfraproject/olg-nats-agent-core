@@ -38,6 +38,7 @@ type StoredDesiredConfig struct {
 	Key       string
 	Revision  uint64
 	CreatedAt time.Time
+	Deleted   bool
 }
 
 // WatchHandler handles desired-config watch updates.

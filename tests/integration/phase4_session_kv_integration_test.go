@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Telecominfraproject/olg-nats-agent-core/agentcore"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 /*
@@ -595,4 +597,239 @@ func waitForClientKVConnected(client *agentcore.Client, timeout time.Duration) e
 		time.Sleep(50 * time.Millisecond)
 	}
 	return context.DeadlineExceeded
+}
+
+/*
+TC-INT-PHASE4-009
+Type: Positive
+Title: KV Watch receives deletion event with Deleted = true when key is deleted
+Summary:
+Verifies that an active KV watch receives a deletion tombstone event with Deleted = true
+when the configuration key is deleted in NATS JetStream KV.
+Validates:
+  - manual key deletion in KV propagates to active watch handler
+  - delivered event has Deleted field set to true
+  - target name is preserved in the delivered record
+*/
+func TestIntegrationWatchDesiredConfigDeletePropagation(t *testing.T) {
+	srv := startTestNATSServer(t)
+	bucket := uniqueName("cfg_desired")
+	target := "vyos"
+
+	client, err := agentcore.New(newIntegrationConfig(srv.URL, bucket, true))
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned unexpected error: %v", err)
+	}
+	defer func() {
+		_ = client.Close(context.Background())
+	}()
+
+	// Write initial value
+	rec := agentcore.DesiredConfigRecord{
+		Version:   "1.0",
+		RPCID:     "rpc-del-1",
+		Target:    target,
+		UUID:      "cfg-del-1",
+		Payload:   json.RawMessage(`{"val":1}`),
+		Timestamp: time.Now().UTC(),
+	}
+	_, err = client.StoreDesiredConfig(context.Background(), rec)
+	if err != nil {
+		t.Fatalf("StoreDesiredConfig failed: %v", err)
+	}
+
+	updates := make(chan agentcore.StoredDesiredConfig, 10)
+	stop, err := client.WatchDesiredConfig(context.Background(), target, func(_ context.Context, stored agentcore.StoredDesiredConfig) error {
+		updates <- stored
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WatchDesiredConfig failed: %v", err)
+	}
+	defer stop()
+
+	// 1. Receive the initial write
+	select {
+	case got := <-updates:
+		if got.Deleted {
+			t.Fatal("expected Deleted to be false for initial write")
+		}
+		if got.Record.UUID != rec.UUID {
+			t.Fatalf("expected uuid %q, got %q", rec.UUID, got.Record.UUID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial watch update")
+	}
+
+	// 2. Delete the key manually using direct NATS KV client
+	nc, err := nats.Connect(srv.URL)
+	if err != nil {
+		t.Fatalf("failed to connect directly to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("failed to create jetstream client: %v", err)
+	}
+
+	kv, err := js.KeyValue(context.Background(), bucket)
+	if err != nil {
+		t.Fatalf("failed to get KV bucket: %v", err)
+	}
+
+	err = kv.Delete(context.Background(), "desired.vyos")
+	if err != nil {
+		t.Fatalf("failed to delete key in KV: %v", err)
+	}
+
+	// 3. Verify watch receives the deletion event with Deleted == true
+	select {
+	case got := <-updates:
+		if !got.Deleted {
+			t.Fatal("expected Deleted to be true on KV delete event")
+		}
+		if got.Record.Target != target {
+			t.Fatalf("expected target %q, got %q", target, got.Record.Target)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for deletion event")
+	}
+}
+
+/*
+TC-INT-PHASE4-010
+Type: Positive
+Title: KV Watch context cancellation handling across reconnect
+Summary:
+Verifies that KV watch context cancellation is respected across connection reconnects
+by checking that pre-canceled watches are not restored, and active restored watches are
+aborted when canceled post-reconnect.
+Validates:
+  - watches with canceled contexts are skipped during reconnect restore
+  - active watches restored post-reconnect are stopped when their context is canceled
+*/
+func TestIntegrationWatchDesiredConfigContextCancellationRestoration(t *testing.T) {
+	srv := startTestNATSServer(t)
+	bucket := uniqueName("cfg_desired")
+	target := "vyos"
+
+	cfg := newIntegrationConfig(srv.URL, bucket, true)
+	cfg.NATS.MaxReconnects = 100
+	cfg.NATS.ReconnectWait = 10 * time.Millisecond
+
+	client, err := agentcore.New(cfg)
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned unexpected error: %v", err)
+	}
+	defer func() {
+		_ = client.Close(context.Background())
+	}()
+
+	// 1. Setup Watch 1 with a context we will cancel BEFORE reconnect
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	updates1 := make(chan agentcore.StoredDesiredConfig, 10)
+	stop1, err := client.WatchDesiredConfig(ctx1, target, func(_ context.Context, stored agentcore.StoredDesiredConfig) error {
+		updates1 <- stored
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WatchDesiredConfig 1 failed: %v", err)
+	}
+	defer stop1()
+
+	// 2. Setup Watch 2 with a context we will cancel AFTER reconnect
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	updates2 := make(chan agentcore.StoredDesiredConfig, 10)
+	stop2, err := client.WatchDesiredConfig(ctx2, target, func(_ context.Context, stored agentcore.StoredDesiredConfig) error {
+		updates2 <- stored
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WatchDesiredConfig 2 failed: %v", err)
+	}
+	defer stop2()
+
+	// Write initial value
+	rec1 := agentcore.DesiredConfigRecord{
+		Version:   "1.0",
+		RPCID:     "rpc-ctx-1",
+		Target:    target,
+		UUID:      "cfg-ctx-1",
+		Payload:   json.RawMessage(`{"val":1}`),
+		Timestamp: time.Now().UTC(),
+	}
+	_, err = client.StoreDesiredConfig(context.Background(), rec1)
+	if err != nil {
+		t.Fatalf("StoreDesiredConfig failed: %v", err)
+	}
+
+	// Drain initial updates from both
+	select {
+	case <-updates1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watch 1 did not receive initial update")
+	}
+	select {
+	case <-updates2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watch 2 did not receive initial update")
+	}
+
+	// Cancel context 1 BEFORE reconnect
+	cancel1()
+
+	// Restart NATS server to trigger reconnect
+	srv.restart(t)
+
+	if err := waitForClientKVConnected(client, 10*time.Second); err != nil {
+		t.Fatalf("client did not reconnect: %v", err)
+	}
+
+	// Watch 1 (canceled before reconnect) should NOT receive the re-delivered initial update
+	select {
+	case got := <-updates1:
+		t.Fatalf("Watch 1 (canceled) unexpectedly received update after reconnect: %+v", got)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// Watch 2 (active during reconnect) should receive the re-delivered update on restore
+	select {
+	case got := <-updates2:
+		if got.Record.UUID != rec1.UUID {
+			t.Fatalf("expected Watch 2 to receive %q, got %q", rec1.UUID, got.Record.UUID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watch 2 did not receive re-delivered update after reconnect")
+	}
+
+	// Cancel context 2 AFTER reconnect
+	cancel2()
+
+	// Store next value
+	rec2 := agentcore.DesiredConfigRecord{
+		Version:   "1.0",
+		RPCID:     "rpc-ctx-2",
+		Target:    target,
+		UUID:      "cfg-ctx-2",
+		Payload:   json.RawMessage(`{"val":2}`),
+		Timestamp: time.Now().UTC(),
+	}
+	_, err = client.StoreDesiredConfig(context.Background(), rec2)
+	if err != nil {
+		t.Fatalf("StoreDesiredConfig failed: %v", err)
+	}
+
+	// Watch 2 (canceled post-reconnect) should NOT receive the new update
+	select {
+	case got := <-updates2:
+		t.Fatalf("Watch 2 (canceled post-reconnect) unexpectedly received update: %+v", got)
+	case <-time.After(400 * time.Millisecond):
+	}
 }

@@ -100,6 +100,7 @@ type StoredDesiredConfig struct {
 	Key       string              `json:"key"`
 	Revision  uint64              `json:"revision"`
 	CreatedAt time.Time           `json:"created_at"`
+	Deleted   bool                `json:"deleted"`
 }
 
 // SubmissionAck reports acceptance of a configure or action submission.

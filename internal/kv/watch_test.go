@@ -381,3 +381,147 @@ func TestWatchDesiredConfigParentCancellationStopsWatchPath(t *testing.T) {
 		t.Fatal("expected stop to complete after parent cancellation")
 	}
 }
+
+/*
+TC-KV-WATCH-009
+Type: Positive
+Title: WatchDesiredConfig propagates delete/purge tombstones as Deleted = true
+Summary:
+Verifies that deletion or purge entries (or empty value entries) are mapped to StoredDesiredConfig
+with Deleted = true and payload cleared, and delivered to the handler rather than dropped.
+Validates:
+  - deletion or purge operations produce Deleted = true
+  - target configuration target identifier is preserved in the record
+  - empty/nil values do not trigger JSON decode errors
+*/
+func TestWatchDesiredConfigPropagatesDeletions(t *testing.T) {
+	watcher := &stubKeyWatcher{updates: make(chan jetstream.KeyValueEntry, 3)}
+	watcher.updates <- nil
+	kvHandle := &stubKeyValue{
+		watchFn: func(context.Context, string, ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+			return watcher, nil
+		},
+	}
+	store, err := NewStore(&stubRuntimeProvider{kv: kvHandle}, nil)
+	if err != nil {
+		t.Fatalf("expected nil constructor error, got %v", err)
+	}
+
+	handlerCalled := make(chan StoredDesiredConfig, 1)
+	stop, err := store.WatchDesiredConfig(context.Background(), "vyos", func(_ context.Context, stored StoredDesiredConfig) error {
+		handlerCalled <- stored
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	defer stop()
+
+	watcher.updates <- stubKeyValueEntry{
+		bucket:   "cfg_desired",
+		key:      "desired.vyos",
+		revision: 42,
+		op:       jetstream.KeyValueDelete,
+		value:    nil,
+	}
+
+	select {
+	case got := <-handlerCalled:
+		if !got.Deleted {
+			t.Fatal("expected Deleted to be true for delete operation")
+		}
+		if got.Record.Target != "vyos" {
+			t.Fatalf("expected target vyos, got %q", got.Record.Target)
+		}
+		if got.Record.UUID != "" {
+			t.Fatalf("expected empty UUID, got %q", got.Record.UUID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected watch handler to receive deletion tombstone")
+	}
+}
+
+/*
+TC-KV-WATCH-010
+Type: Positive
+Title: WatchDesiredConfig buffers initial updates until watch is ready
+Summary:
+Verifies that pre-existing entries (buffered during initial replay) are not dispatched to
+the user handler until the ready signal has been triggered.
+Validates:
+  - initial updates are buffered inside consumeWatch
+  - no handler invocation occurs before WatchDesiredConfig ready signal
+  - buffered updates are flushed in order when the watch is marked ready
+*/
+func TestWatchDesiredConfigBuffersInitialUpdates(t *testing.T) {
+	rec := validDesiredConfigRecordForTests()
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("failed to marshal record: %v", err)
+	}
+
+	watcher := &stubKeyWatcher{updates: make(chan jetstream.KeyValueEntry, 5)}
+	watcher.updates <- stubKeyValueEntry{
+		bucket:   "cfg_desired",
+		key:      "desired.vyos",
+		revision: 10,
+		value:    payload,
+	}
+
+	kvHandle := &stubKeyValue{
+		watchFn: func(context.Context, string, ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+			return watcher, nil
+		},
+	}
+	store, err := NewStore(&stubRuntimeProvider{kv: kvHandle}, nil)
+	if err != nil {
+		t.Fatalf("expected nil constructor error, got %v", err)
+	}
+
+	var handlerCalls int32
+	var returnedFlag int32
+
+	type watchResult struct {
+		stop StopFunc
+		err  error
+	}
+	resCh := make(chan watchResult, 1)
+
+	go func() {
+		stop, err := store.WatchDesiredConfig(context.Background(), "vyos", func(context.Context, StoredDesiredConfig) error {
+			atomic.AddInt32(&handlerCalls, 1)
+			if atomic.LoadInt32(&returnedFlag) == 0 {
+				t.Error("handler called before watch returned (not ready yet)")
+			}
+			return nil
+		})
+		resCh <- watchResult{stop: stop, err: err}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if atomic.LoadInt32(&handlerCalls) != 0 {
+		t.Fatal("handler was called before watch ready indicator received")
+	}
+
+	atomic.StoreInt32(&returnedFlag, 1)
+	watcher.updates <- nil
+
+	var res watchResult
+	select {
+	case res = <-resCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for WatchDesiredConfig to return")
+	}
+
+	if res.err != nil {
+		t.Fatalf("WatchDesiredConfig returned error: %v", res.err)
+	}
+	defer res.stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if atomic.LoadInt32(&handlerCalls) != 1 {
+		t.Fatalf("expected 1 handler call, got %d", atomic.LoadInt32(&handlerCalls))
+	}
+}

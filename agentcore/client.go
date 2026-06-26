@@ -93,6 +93,7 @@ type activeWatch struct {
 	target  string
 	handler DesiredConfigWatchHandler
 	stopFn  StopFunc
+	ctx     context.Context
 }
 
 // WithReconnectHandler registers a handler to be invoked when the NATS session is reconnected.
@@ -580,6 +581,7 @@ func (c *Client) WatchDesiredConfig(ctx context.Context, target string, handler 
 		id:      id,
 		target:  target,
 		handler: handler,
+		ctx:     ctx,
 	}
 	c.activeWatches[id] = intent
 	c.watchMu.Unlock()
@@ -599,6 +601,7 @@ func (c *Client) WatchDesiredConfig(ctx context.Context, target string, handler 
 				Key:       stored.Key,
 				Revision:  stored.Revision,
 				CreatedAt: stored.CreatedAt,
+				Deleted:   stored.Deleted,
 			})
 		})
 		if err != nil {
@@ -662,18 +665,48 @@ func (c *Client) RegisterStatusHandler(target string, handler StatusHandler, opt
 }
 
 func (c *Client) restoreAllActiveWatches() error {
-	c.watchMu.Lock()
-	defer c.watchMu.Unlock()
+	type watchCopy struct {
+		id      uint64
+		target  string
+		handler DesiredConfigWatchHandler
+		ctx     context.Context
+	}
 
-	var joined error
-	for _, intent := range c.activeWatches {
-		c.logInfo("restoring KV watch", "target", intent.target)
-		if intent.stopFn != nil {
-			_ = intent.stopFn()
+	c.watchMu.Lock()
+	var toRestore []watchCopy
+	for id, intent := range c.activeWatches {
+		if intent.ctx.Err() != nil {
+			if intent.stopFn != nil {
+				_ = intent.stopFn()
+			}
+			delete(c.activeWatches, id)
+			continue
+		}
+		toRestore = append(toRestore, watchCopy{
+			id:      intent.id,
+			target:  intent.target,
+			handler: intent.handler,
+			ctx:     intent.ctx,
+		})
+	}
+	c.watchMu.Unlock()
+
+	type restoreResult struct {
+		id     uint64
+		stopFn StopFunc
+		err    error
+	}
+	results := make([]restoreResult, 0, len(toRestore))
+
+	for _, w := range toRestore {
+		if w.ctx.Err() != nil {
+			results = append(results, restoreResult{id: w.id, err: w.ctx.Err()})
+			continue
 		}
 
-		handler := intent.handler
-		stop, err := c.kv.WatchDesiredConfig(context.Background(), intent.target, func(watchCtx context.Context, stored kv.StoredDesiredConfig) error {
+		c.logInfo("restoring KV watch", "target", w.target)
+		handler := w.handler
+		stop, err := c.kv.WatchDesiredConfig(w.ctx, w.target, func(watchCtx context.Context, stored kv.StoredDesiredConfig) error {
 			return handler(watchCtx, StoredDesiredConfig{
 				Record: DesiredConfigRecord{
 					Version:   stored.Record.Version,
@@ -687,17 +720,49 @@ func (c *Client) restoreAllActiveWatches() error {
 				Key:       stored.Key,
 				Revision:  stored.Revision,
 				CreatedAt: stored.CreatedAt,
+				Deleted:   stored.Deleted,
 			})
 		})
-		if err != nil {
-			joined = errors.Join(joined, err)
-			c.logError("failed to restore KV watch", "target", intent.target, "error", err)
-			if c.options.errorSink != nil {
-				c.options.errorSink(err)
+
+		results = append(results, restoreResult{
+			id:     w.id,
+			stopFn: StopFunc(stop),
+			err:    err,
+		})
+	}
+
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+
+	var joined error
+	for _, res := range results {
+		intent, exists := c.activeWatches[res.id]
+		if !exists {
+			if res.stopFn != nil {
+				_ = res.stopFn()
 			}
 			continue
 		}
-		intent.stopFn = StopFunc(stop)
+
+		if res.err != nil {
+			joined = errors.Join(joined, res.err)
+			c.logError("failed to restore KV watch", "target", intent.target, "error", res.err)
+			if c.options.errorSink != nil {
+				c.options.errorSink(res.err)
+			}
+			if intent.ctx.Err() != nil {
+				if intent.stopFn != nil {
+					_ = intent.stopFn()
+				}
+				delete(c.activeWatches, res.id)
+			}
+			continue
+		}
+
+		if intent.stopFn != nil {
+			_ = intent.stopFn()
+		}
+		intent.stopFn = res.stopFn
 	}
 	return joined
 }

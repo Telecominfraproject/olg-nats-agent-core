@@ -258,6 +258,12 @@ The library must expose APIs to:
 
 The primary load path is **load current desired config**, not load arbitrary historical revisions.
 
+### 10.4 KV configuration deletion delivery
+
+In NATS JetStream Key-Value, deleting or purging a key sends an entry with an empty value (a tombstone).
+When a deletion or purge event occurs, the desired-config watcher must deliver a `StoredDesiredConfig` structure with `Deleted = true` and the Record payload cleared (empty/nil) to the registered watch handler, rather than silently discarding the event.
+
+
 ---
 
 ## 11. Reconnect and recovery model

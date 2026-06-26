@@ -45,7 +45,7 @@ func (s *Store) WatchDesiredConfig(ctx context.Context, target string, handler W
 	ready := make(chan struct{})
 	done := make(chan struct{})
 
-	go s.consumeWatch(watchCtx, watcher, handler, ready, done)
+	go s.consumeWatch(watchCtx, target, watcher, handler, ready, done)
 
 	if err := waitForWatchReady(ctx, s.runtime.KVTimeout(), ready, done); err != nil {
 		cancelWatch()
@@ -101,7 +101,7 @@ func waitForWatchReady(ctx context.Context, timeout time.Duration, ready <-chan 
 	}
 }
 
-func (s *Store) consumeWatch(ctx context.Context, watcher jetstream.KeyWatcher, handler WatchHandler, ready chan<- struct{}, done chan<- struct{}) {
+func (s *Store) consumeWatch(ctx context.Context, target string, watcher jetstream.KeyWatcher, handler WatchHandler, ready chan<- struct{}, done chan<- struct{}) {
 	defer close(done)
 
 	var readyOnce sync.Once
@@ -111,6 +111,9 @@ func (s *Store) consumeWatch(ctx context.Context, watcher jetstream.KeyWatcher, 
 		})
 	}
 	defer markReady()
+
+	var buffer []StoredDesiredConfig
+	isReady := false
 
 	updates := watcher.Updates()
 	for {
@@ -126,16 +129,29 @@ func (s *Store) consumeWatch(ctx context.Context, watcher jetstream.KeyWatcher, 
 			}
 			if entry == nil {
 				markReady()
-				continue
-			}
-			if len(entry.Value()) == 0 {
+				for _, stored := range buffer {
+					if err := handler(ctx, stored); err != nil {
+						s.reportAsync(kvReadError("watch_desired_config_handler", "desired-config watch handler returned error", err))
+					}
+				}
+				buffer = nil
+				isReady = true
 				continue
 			}
 
-			rec, err := decodeDesiredConfigRecord(entry.Value())
-			if err != nil {
-				s.reportAsync(kvReadError("watch_desired_config_decode", "failed to decode desired-config watch entry", err))
-				continue
+			deleted := entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge || len(entry.Value()) == 0
+			var rec DesiredConfigRecord
+			if !deleted {
+				var err error
+				rec, err = decodeDesiredConfigRecord(entry.Value())
+				if err != nil {
+					s.reportAsync(kvReadError("watch_desired_config_decode", "failed to decode desired-config watch entry", err))
+					continue
+				}
+			} else {
+				rec = DesiredConfigRecord{
+					Target: target,
+				}
 			}
 
 			stored := StoredDesiredConfig{
@@ -143,6 +159,7 @@ func (s *Store) consumeWatch(ctx context.Context, watcher jetstream.KeyWatcher, 
 				Bucket:   entry.Bucket(),
 				Key:      entry.Key(),
 				Revision: entry.Revision(),
+				Deleted:  deleted,
 			}
 			if !entry.Created().IsZero() {
 				stored.CreatedAt = entry.Created()
@@ -150,8 +167,12 @@ func (s *Store) consumeWatch(ctx context.Context, watcher jetstream.KeyWatcher, 
 				stored.CreatedAt = rec.Timestamp
 			}
 
-			if err := handler(ctx, stored); err != nil {
-				s.reportAsync(kvReadError("watch_desired_config_handler", "desired-config watch handler returned error", err))
+			if !isReady {
+				buffer = append(buffer, stored)
+			} else {
+				if err := handler(ctx, stored); err != nil {
+					s.reportAsync(kvReadError("watch_desired_config_handler", "desired-config watch handler returned error", err))
+				}
 			}
 		}
 	}
