@@ -465,9 +465,7 @@ func TestStartActivationFailureDisablesCallbacksAndCleansPartials(t *testing.T) 
 	if got := client.Health().ActiveSubscriptions; got != 0 {
 		t.Fatalf("expected ActiveSubscriptions %d after cleanup, got %d", 0, got)
 	}
-	client.mu.RLock()
-	handlerCtx := client.handlerCtx
-	client.mu.RUnlock()
+	handlerCtx := client.handlerCtx.Load()
 	if handlerCtx != nil {
 		t.Fatal("expected handler context to remain nil on failed start")
 	}
@@ -519,12 +517,11 @@ func TestStartEnablesCallbacksAfterSuccessfulActivation(t *testing.T) {
 	if got := client.Health().ActiveSubscriptions; got != 1 {
 		t.Fatalf("expected ActiveSubscriptions %d after activation, got %d", 1, got)
 	}
-	client.mu.RLock()
-	handlerCtx := client.handlerCtx
-	client.mu.RUnlock()
-	if handlerCtx == nil {
+	handlerCtxPtr := client.handlerCtx.Load()
+	if handlerCtxPtr == nil {
 		t.Fatal("expected handler context to be created after successful start")
 	}
+	handlerCtx := *handlerCtxPtr
 	select {
 	case <-handlerCtx.Done():
 		t.Fatal("expected handler context to remain active after successful start")

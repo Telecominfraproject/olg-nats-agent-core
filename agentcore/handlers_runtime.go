@@ -626,7 +626,7 @@ func (c *Client) bindConfigureCallback(handler ConfigureHandler) nats.MsgHandler
 			return
 		}
 		if c.options.metrics != nil {
-			c.options.metrics.ObservePublishLatency(string(registry.KindConfigure), msg.Subject, time.Since(started))
+			c.options.metrics.ObserveHandlerLatency(string(registry.KindConfigure), msg.Subject, time.Since(started))
 		}
 	}
 }
@@ -660,7 +660,7 @@ func (c *Client) bindActionCallback(handler ActionHandler) nats.MsgHandler {
 			return
 		}
 		if c.options.metrics != nil {
-			c.options.metrics.ObservePublishLatency(string(registry.KindAction), msg.Subject, time.Since(started))
+			c.options.metrics.ObserveHandlerLatency(string(registry.KindAction), msg.Subject, time.Since(started))
 		}
 	}
 }
@@ -694,7 +694,7 @@ func (c *Client) bindResultCallback(handler ResultHandler) nats.MsgHandler {
 			return
 		}
 		if c.options.metrics != nil {
-			c.options.metrics.ObservePublishLatency(string(registry.KindResult), msg.Subject, time.Since(started))
+			c.options.metrics.ObserveHandlerLatency(string(registry.KindResult), msg.Subject, time.Since(started))
 		}
 	}
 }
@@ -728,7 +728,7 @@ func (c *Client) bindStatusCallback(handler StatusHandler) nats.MsgHandler {
 			return
 		}
 		if c.options.metrics != nil {
-			c.options.metrics.ObservePublishLatency(string(registry.KindStatus), msg.Subject, time.Since(started))
+			c.options.metrics.ObserveHandlerLatency(string(registry.KindStatus), msg.Subject, time.Since(started))
 		}
 	}
 }

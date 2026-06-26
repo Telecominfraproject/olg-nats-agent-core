@@ -88,6 +88,12 @@ func WithErrorSink(fn func(error)) Option {
 	}
 }
 
+var canceledCtx = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
 type activeWatch struct {
 	id      uint64
 	target  string
@@ -117,7 +123,7 @@ type Client struct {
 	subscriptions *registry.Registry
 	subjects      *subjects.Builder
 	publisher     publisher
-	handlerCtx    context.Context
+	handlerCtx    atomic.Pointer[context.Context]
 	handlerCancel context.CancelFunc
 
 	nextWatchID   uint64
@@ -312,9 +318,10 @@ func (c *Client) ensureHandlerContext() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.handlerCtx != nil {
+	cur := c.handlerCtx.Load()
+	if cur != nil {
 		select {
-		case <-c.handlerCtx.Done():
+		case <-(*cur).Done():
 			// Existing lifecycle context is canceled and must be replaced.
 		default:
 			// Existing lifecycle context is still active; keep it.
@@ -322,14 +329,13 @@ func (c *Client) ensureHandlerContext() {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c.handlerCtx = ctx
+	c.handlerCtx.Store(&ctx)
 	c.handlerCancel = cancel
 }
 
 func (c *Client) cancelHandlerContext() {
 	c.mu.Lock()
 	cancel := c.handlerCancel
-	c.handlerCtx = nil
 	c.handlerCancel = nil
 	c.mu.Unlock()
 
@@ -339,13 +345,11 @@ func (c *Client) cancelHandlerContext() {
 }
 
 func (c *Client) handlerContext() context.Context {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.handlerCtx != nil {
-		return c.handlerCtx
+	cur := c.handlerCtx.Load()
+	if cur != nil {
+		return *cur
 	}
-	return context.Background()
+	return canceledCtx
 }
 
 // Health returns the latest public health snapshot.

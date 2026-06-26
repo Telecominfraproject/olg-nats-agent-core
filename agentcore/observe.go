@@ -17,5 +17,5 @@ type Metrics interface {
 	IncPublish(kind, subject, result string)
 	ObservePublishLatency(kind, subject string, d time.Duration)
 	IncSubscribe(kind, subject, result string)
-	IncKV(op, result string)
+	ObserveHandlerLatency(kind, subject string, d time.Duration)
 }

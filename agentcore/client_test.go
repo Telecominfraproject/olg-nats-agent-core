@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Telecominfraproject/olg-nats-agent-core/internal/registry"
+	"github.com/nats-io/nats.go"
 )
 
 type testLogger struct {
@@ -17,17 +21,40 @@ func (l *testLogger) Info(msg string, kv ...any)  { l.entries = append(l.entries
 func (l *testLogger) Warn(msg string, kv ...any)  { l.entries = append(l.entries, "WARN:"+msg) }
 func (l *testLogger) Error(msg string, kv ...any) { l.entries = append(l.entries, "ERROR:"+msg) }
 
-type testMetrics struct {
-	connectCalls int
-	states       []string
+type handlerLatencyCall struct {
+	kind    string
+	subject string
+	d       time.Duration
 }
 
-func (m *testMetrics) IncConnect(result string)                                    { m.connectCalls++ }
-func (m *testMetrics) SetConnectionState(state string)                             { m.states = append(m.states, state) }
+type testMetrics struct {
+	mu                  sync.Mutex
+	connectCalls        int
+	states              []string
+	handlerLatencyCalls []handlerLatencyCall
+}
+
+func (m *testMetrics) IncConnect(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.connectCalls++
+}
+
+func (m *testMetrics) SetConnectionState(state string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.states = append(m.states, state)
+}
+
 func (m *testMetrics) IncPublish(kind, subject, result string)                     {}
 func (m *testMetrics) ObservePublishLatency(kind, subject string, d time.Duration) {}
 func (m *testMetrics) IncSubscribe(kind, subject, result string)                   {}
-func (m *testMetrics) IncKV(op, result string)                                     {}
+
+func (m *testMetrics) ObserveHandlerLatency(kind, subject string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.handlerLatencyCalls = append(m.handlerLatencyCalls, handlerLatencyCall{kind: kind, subject: subject, d: d})
+}
 
 func testConfig() Config {
 	return Config{
@@ -1007,5 +1034,183 @@ func TestWithReconnectHandlerPanicSafety(t *testing.T) {
 	expectedMsg := "reconnect handler panicked: simulated database reconnect failure"
 	if caughtErr.Error() != expectedMsg {
 		t.Fatalf("expected error message %q, got %q", expectedMsg, caughtErr.Error())
+	}
+}
+
+/*
+TC-CLIENT-018
+Type: Positive
+Title: Handler context has correct lifecycle transitions
+Summary:
+Verifies that handlerContext() returns a pre-canceled context when the client is not yet started,
+an active context after starting, a canceled context after closing, and a new active context after restart.
+Validates:
+  - handlerContext() returns canceled context pre-start
+  - handlerContext() returns active context post-start
+  - handlerContext() returns canceled context post-close
+  - handlerContext() returns new active context on restart
+*/
+func TestHandlerContextLifecycle(t *testing.T) {
+	client, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	// 1. Pre-start: should return pre-canceled context
+	ctx := client.handlerContext()
+	if ctx == nil {
+		t.Fatal("expected non-nil context pre-start")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("expected pre-start context to be canceled")
+	}
+
+	// 2. Start: should return active context
+	client.ensureHandlerContext()
+	ctx = client.handlerContext()
+	if ctx == nil {
+		t.Fatal("expected non-nil context after ensure")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("expected context to be active after ensure, got error: %v", ctx.Err())
+	}
+
+	// 3. Cancel: should return canceled context (not nil)
+	client.cancelHandlerContext()
+	ctx = client.handlerContext()
+	if ctx == nil {
+		t.Fatal("expected non-nil context after cancel")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("expected context to be canceled after cancel")
+	}
+
+	// 4. Restart (ensure again): should return new active context
+	client.ensureHandlerContext()
+	ctx2 := client.handlerContext()
+	if ctx2 == nil {
+		t.Fatal("expected non-nil context after second ensure")
+	}
+	if ctx2.Err() != nil {
+		t.Fatalf("expected context to be active after second ensure, got error: %v", ctx2.Err())
+	}
+	if ctx == ctx2 {
+		t.Fatal("expected a new context instance on restart")
+	}
+}
+
+/*
+TC-CLIENT-019
+Type: Positive
+Title: Inbound callbacks invoke ObserveHandlerLatency with correct parameters
+Summary:
+Verifies that the configure, action, result, and status callbacks invoke the ObserveHandlerLatency
+metrics hook with the correct kind, subject, and latency duration.
+Validates:
+  - bindConfigureCallback calls ObserveHandlerLatency
+  - bindActionCallback calls ObserveHandlerLatency
+  - bindResultCallback calls ObserveHandlerLatency
+  - bindStatusCallback calls ObserveHandlerLatency
+*/
+func TestInboundHandlerLatencyMetrics(t *testing.T) {
+	metrics := &testMetrics{}
+	client, err := New(testConfig(), WithMetrics(metrics))
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	// Enable callbacks
+	client.callbacksEnabled.Store(true)
+
+	// 1. Configure Callback
+	cfgCb := client.bindConfigureCallback(func(context.Context, ConfigureNotification) error {
+		return nil
+	})
+	cfgNotif := ConfigureNotification{
+		Version:     "1.0",
+		RPCID:       "rpc-1",
+		Target:      "vyos",
+		CommandType: "configure",
+		UUID:        "uuid-1",
+		KVBucket:    "bucket-1",
+		KVKey:       "key-1",
+		Timestamp:   time.Now(),
+	}
+	cfgNotifBytes, _ := json.Marshal(cfgNotif)
+	cfgCb(&nats.Msg{Subject: "cmd.configure.vyos", Data: cfgNotifBytes})
+
+	// 2. Action Callback
+	actCb := client.bindActionCallback(func(context.Context, ActionCommand) error {
+		return nil
+	})
+	actCmd := ActionCommand{
+		Version:     "1.0",
+		RPCID:       "rpc-2",
+		Target:      "vyos",
+		CommandType: "action",
+		Action:      "reboot",
+		Timestamp:   time.Now(),
+	}
+	actCmdBytes, _ := json.Marshal(actCmd)
+	actCb(&nats.Msg{Subject: "cmd.action.vyos.reboot", Data: actCmdBytes})
+
+	// 3. Result Callback
+	resCb := client.bindResultCallback(func(context.Context, ResultEnvelope) error {
+		return nil
+	})
+	resEnv := ResultEnvelope{
+		Version:   "1.0",
+		RPCID:     "rpc-3",
+		Target:    "vyos",
+		Result:    "success",
+		Timestamp: time.Now(),
+	}
+	resEnvBytes, _ := json.Marshal(resEnv)
+	resCb(&nats.Msg{Subject: "result.vyos", Data: resEnvBytes})
+
+	// 4. Status Callback
+	statCb := client.bindStatusCallback(func(context.Context, StatusEnvelope) error {
+		return nil
+	})
+	statEnv := StatusEnvelope{
+		Version:   "1.0",
+		RPCID:     "rpc-4",
+		Target:    "vyos",
+		Status:    "running",
+		Timestamp: time.Now(),
+	}
+	statEnvBytes, _ := json.Marshal(statEnv)
+	statCb(&nats.Msg{Subject: "status.vyos", Data: statEnvBytes})
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+
+	if len(metrics.handlerLatencyCalls) != 4 {
+		t.Fatalf("expected 4 ObserveHandlerLatency calls, got %d", len(metrics.handlerLatencyCalls))
+	}
+
+	expectedKinds := []string{
+		string(registry.KindConfigure),
+		string(registry.KindAction),
+		string(registry.KindResult),
+		string(registry.KindStatus),
+	}
+	expectedSubjects := []string{
+		"cmd.configure.vyos",
+		"cmd.action.vyos.reboot",
+		"result.vyos",
+		"status.vyos",
+	}
+
+	for i, call := range metrics.handlerLatencyCalls {
+		if call.kind != expectedKinds[i] {
+			t.Errorf("call %d: expected kind %q, got %q", i, expectedKinds[i], call.kind)
+		}
+		if call.subject != expectedSubjects[i] {
+			t.Errorf("call %d: expected subject %q, got %q", i, expectedSubjects[i], call.subject)
+		}
+		if call.d <= 0 {
+			t.Errorf("call %d: expected positive duration, got %v", i, call.d)
+		}
 	}
 }
