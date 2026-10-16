@@ -23,6 +23,8 @@ type Hooks struct {
 	ErrorSink func(error)
 	// OnReconnected is called after session handles are rebound on reconnect.
 	OnReconnected func()
+	// OnDisconnected is called when the NATS connection drops.
+	OnDisconnected func()
 	// OnClosed is called after the session transitions to a closed state.
 	OnClosed func()
 }

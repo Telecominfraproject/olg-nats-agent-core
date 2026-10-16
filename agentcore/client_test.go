@@ -1026,6 +1026,87 @@ func TestWithReconnectHandlerPanicSafety(t *testing.T) {
 	}
 }
 
+func TestWithDisconnectHandlerOption(t *testing.T) {
+	fired := false
+	handler := func() {
+		fired = true
+	}
+
+	client, err := New(testConfig(), WithDisconnectHandler(handler))
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	if client.options.disconnectHandler == nil {
+		t.Fatal("expected disconnectHandler option to be stored on client")
+	}
+
+	client.callbacksEnabled.Store(true)
+	client.onSessionDisconnected()
+
+	if !fired {
+		t.Fatal("expected disconnect handler to be fired")
+	}
+}
+
+func TestWithDisconnectHandler_CallbacksDisabled(t *testing.T) {
+	fired := false
+	handler := func() {
+		fired = true
+	}
+
+	client, err := New(testConfig(), WithDisconnectHandler(handler))
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	client.callbacksEnabled.Store(false)
+	client.onSessionDisconnected()
+
+	if fired {
+		t.Fatal("expected disconnect handler not to fire when callbacks are disabled")
+	}
+}
+
+func TestWithDisconnectHandler_NoHandlerRegistered(t *testing.T) {
+	client, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	client.callbacksEnabled.Store(true)
+	client.onSessionDisconnected()
+}
+
+func TestWithDisconnectHandlerPanicSafety(t *testing.T) {
+	panicMsg := "simulated disconnect handler panic"
+	var caughtErr error
+	sink := func(err error) {
+		caughtErr = err
+	}
+
+	handler := func() {
+		panic(panicMsg)
+	}
+
+	client, err := New(testConfig(), WithDisconnectHandler(handler), WithErrorSink(sink))
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	client.callbacksEnabled.Store(true)
+	client.onSessionDisconnected()
+
+	if caughtErr == nil {
+		t.Fatal("expected panic to be reported to error sink, got nil error")
+	}
+
+	expectedMsg := "disconnect handler panicked: simulated disconnect handler panic"
+	if caughtErr.Error() != expectedMsg {
+		t.Fatalf("expected error message %q, got %q", expectedMsg, caughtErr.Error())
+	}
+}
+
 /*
 TC-CLIENT-018
 Type: Positive

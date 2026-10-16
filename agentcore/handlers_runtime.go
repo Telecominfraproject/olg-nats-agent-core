@@ -513,6 +513,28 @@ func (c *Client) onSessionReconnected() {
 	}
 }
 
+func (c *Client) onSessionDisconnected() {
+	if !c.callbacksEnabled.Load() {
+		return
+	}
+	c.logWarn("session disconnected")
+
+	if c.options.disconnectHandler != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err := fmt.Errorf("disconnect handler panicked: %v", r)
+					c.logError("disconnect handler panicked", "error", err)
+					if c.options.errorSink != nil {
+						c.options.errorSink(err)
+					}
+				}
+			}()
+			c.options.disconnectHandler()
+		}()
+	}
+}
+
 func (c *Client) onSessionClosed() {
 	c.callbacksEnabled.Store(false)
 	c.cancelHandlerContext()

@@ -43,11 +43,12 @@ type SubscriptionOptions struct {
 }
 
 type clientOptions struct {
-	logger           Logger
-	metrics          Metrics
-	now              func() time.Time
-	errorSink        func(error)
-	reconnectHandler func()
+	logger            Logger
+	metrics           Metrics
+	now               func() time.Time
+	errorSink         func(error)
+	reconnectHandler  func()
+	disconnectHandler func()
 }
 
 // Option applies an optional public client setting during construction.
@@ -106,6 +107,14 @@ type activeWatch struct {
 func WithReconnectHandler(handler func()) Option {
 	return func(opts *clientOptions) error {
 		opts.reconnectHandler = handler
+		return nil
+	}
+}
+
+// WithDisconnectHandler registers a handler to be invoked when the NATS session is disconnected.
+func WithDisconnectHandler(handler func()) Option {
+	return func(opts *clientOptions) error {
+		opts.disconnectHandler = handler
 		return nil
 	}
 }
@@ -230,6 +239,7 @@ func New(cfg Config, opts ...Option) (*Client, error) {
 	}
 	client.syncSubscriptionHealth()
 	runtime.SetReconnectHandler(client.onSessionReconnected)
+	runtime.SetDisconnectHandler(client.onSessionDisconnected)
 	runtime.SetClosedHandler(client.onSessionClosed)
 
 	return client, nil

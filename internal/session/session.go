@@ -133,6 +133,13 @@ func (m *Manager) SetReconnectHandler(fn func()) {
 	m.hooks.OnReconnected = fn
 }
 
+// SetDisconnectHandler updates the disconnect callback hook.
+func (m *Manager) SetDisconnectHandler(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hooks.OnDisconnected = fn
+}
+
 // SetClosedHandler updates the closed callback hook.
 func (m *Manager) SetClosedHandler(fn func()) {
 	m.mu.Lock()

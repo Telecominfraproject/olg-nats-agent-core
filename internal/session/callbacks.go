@@ -11,12 +11,28 @@ import (
 
 func (m *Manager) onDisconnect(_ *nats.Conn, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.closing {
+		m.mu.Unlock()
 		return
 	}
 	m.setReconnectingLocked(err)
+	onDisconnected := m.hooks.OnDisconnected
+	m.mu.Unlock()
+
+	if onDisconnected != nil {
+		onDisconnected()
+	}
+
+	if err != nil {
+		disconnectErr := &runtimeerr.Error{
+			Code:      runtimeerr.CodeDisconnected,
+			Op:        "session_disconnect",
+			Message:   "NATS session disconnected",
+			Retryable: true,
+			Err:       err,
+		}
+		go m.onAsyncError(disconnectErr)
+	}
 }
 
 func (m *Manager) onReconnect(nc *nats.Conn) {

@@ -2,9 +2,11 @@ package session
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Telecominfraproject/olg-nats-agent-core/internal/runtimeerr"
 	"github.com/nats-io/nats.go"
 )
 
@@ -52,7 +54,15 @@ Validates:
   - existing health state is preserved
 */
 func TestOnDisconnectNoOpWhenClosing(t *testing.T) {
-	m := &Manager{closing: true}
+	hookFired := false
+	m := &Manager{
+		closing: true,
+		hooks: Hooks{
+			OnDisconnected: func() {
+				hookFired = true
+			},
+		},
+	}
 	m.health.State = StateDraining
 	m.health.LastError = "existing"
 
@@ -63,6 +73,131 @@ func TestOnDisconnectNoOpWhenClosing(t *testing.T) {
 	}
 	if m.health.LastError != "existing" {
 		t.Fatalf("expected LastError to remain %q, got %q", "existing", m.health.LastError)
+	}
+	if hookFired {
+		t.Fatal("expected OnDisconnected hook not to fire when closing")
+	}
+}
+
+func TestOnDisconnectForwardsErrorToSink(t *testing.T) {
+	sinkErrCh := make(chan error, 1)
+	hookFiredCh := make(chan struct{}, 1)
+	m := &Manager{
+		hooks: Hooks{
+			ErrorSink: func(err error) {
+				sinkErrCh <- err
+			},
+			OnDisconnected: func() {
+				hookFiredCh <- struct{}{}
+			},
+		},
+	}
+
+	testErr := errors.New("connection reset by peer")
+	m.onDisconnect(nil, testErr)
+
+	select {
+	case <-hookFiredCh:
+		// success
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected OnDisconnected hook to be invoked")
+	}
+
+	select {
+	case sinkErr := <-sinkErrCh:
+		if sinkErr == nil {
+			t.Fatal("expected disconnect error to be forwarded to ErrorSink")
+		}
+		var rtErr *runtimeerr.Error
+		if !errors.As(sinkErr, &rtErr) {
+			t.Fatalf("expected runtimeerr.Error, got: %T", sinkErr)
+		}
+		if rtErr.Code != runtimeerr.CodeDisconnected {
+			t.Errorf("expected CodeDisconnected, got: %v", rtErr.Code)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for ErrorSink invocation")
+	}
+}
+
+func TestOnDisconnectIndependentOfSlowErrorSink(t *testing.T) {
+	blockSink := make(chan struct{})
+	defer close(blockSink)
+
+	hookFiredCh := make(chan struct{}, 1)
+	m := &Manager{
+		hooks: Hooks{
+			ErrorSink: func(err error) {
+				<-blockSink
+			},
+			OnDisconnected: func() {
+				hookFiredCh <- struct{}{}
+			},
+		},
+	}
+
+	go m.onDisconnect(nil, errors.New("connection lost"))
+
+	select {
+	case <-hookFiredCh:
+		// Succeeded: OnDisconnected executed immediately without waiting on blocked ErrorSink
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("OnDisconnected hook was blocked or delayed by slow ErrorSink")
+	}
+}
+
+func TestLifecycleHookOrdering_DisconnectBeforeReconnect(t *testing.T) {
+	order := make([]string, 0, 2)
+	var orderMu sync.Mutex
+
+	m := &Manager{
+		hooks: Hooks{
+			OnDisconnected: func() {
+				orderMu.Lock()
+				order = append(order, "disconnected")
+				orderMu.Unlock()
+			},
+			OnReconnected: func() {
+				orderMu.Lock()
+				order = append(order, "reconnected")
+				orderMu.Unlock()
+			},
+		},
+	}
+
+	// 1. Disconnect triggers OnDisconnected synchronously
+	m.onDisconnect(nil, errors.New("connection drop"))
+
+	// 2. Reconnect triggers OnReconnected
+	if m.hooks.OnReconnected != nil {
+		m.hooks.OnReconnected()
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(order) != 2 {
+		t.Fatalf("expected 2 lifecycle events, got %d: %v", len(order), order)
+	}
+	if order[0] != "disconnected" || order[1] != "reconnected" {
+		t.Fatalf("lifecycle order violated: expected [disconnected, reconnected], got %v", order)
+	}
+}
+
+func TestOnDisconnectInvokesRegisteredHookOutsideLock(t *testing.T) {
+	m := &Manager{}
+	done := make(chan struct{}, 1)
+	m.hooks.OnDisconnected = func() {
+		// Calling a lock-taking method will deadlock if m.mu is held during onDisconnect
+		m.SetReconnectHandler(nil)
+		done <- struct{}{}
+	}
+
+	go m.onDisconnect(nil, errors.New("network drop"))
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for OnDisconnected hook invocation (possible deadlock)")
 	}
 }
 

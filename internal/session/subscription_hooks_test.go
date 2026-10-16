@@ -96,3 +96,24 @@ func TestSetClosedHandlerStoresCallback(t *testing.T) {
 		t.Fatalf("expected closed callback calls %d, got %d", 1, calls)
 	}
 }
+
+func TestSetDisconnectHandlerStoresCallback(t *testing.T) {
+	m, err := NewManager(testSessionConfig(), Hooks{})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	calls := 0
+	m.SetDisconnectHandler(func() {
+		calls++
+	})
+
+	if m.hooks.OnDisconnected == nil {
+		t.Fatal("expected disconnect hook to be set")
+	}
+
+	m.hooks.OnDisconnected()
+	if calls != 1 {
+		t.Fatalf("expected disconnect callback calls %d, got %d", 1, calls)
+	}
+}
