@@ -194,9 +194,9 @@ Actions are not stored in KV as desired state.
 
 ---
 
-## 8. Result and status contract
+## 8. Result, status, and state contract
 
-The library must provide standard result and status message envelopes.
+The library must provide standard result, status, and state message envelopes.
 
 Result and status messages must preserve shared correlation fields consistently.
 
@@ -208,6 +208,13 @@ For action flows:
 - result/status must carry `rpc_id`
 - action-specific fields may be included as needed by the action contract
 
+For periodic device state:
+- The library provides a dedicated `StateEnvelope` containing `target`, `uuid`, `timestamp`, and the structured state `payload` (e.g. OpenWiFi state schema).
+- **Strict Subject & Contract Separation:**
+  - `status.<target>` is strictly reserved for lifecycle events (startup) and configure/action execution progress.
+  - `state.<target>` is used exclusively for periodic operational state and telemetry.
+  - These message types are not interchangeable. Publishing full device-state payloads on the status subject could cause consumers to interpret them as progress/status messages or reject them as invalid.
+
 ---
 
 ## 9. Subject model
@@ -218,12 +225,21 @@ The default subject structure is target-oriented:
 - `cmd.action.<target>.<action>`
 - `result.<target>`
 - `status.<target>`
+- `state.<target>`
 - `health.<target>`
 
-All subject generation must be centralized in the library.
+All subject generation must be centralized in the library (`internal/subjects`).
 Consuming agents must not construct raw subjects ad hoc throughout the codebase.
 
 The library must validate subject inputs such as target and action before publishing or subscribing.
+
+Subject routing rules:
+- `cmd.configure.<target>`: Configure trigger notifications after storing desired config in KV.
+- `cmd.action.<target>.<action>`: Direct action command delivery.
+- `result.<target>`: Final command completion/failure outcomes.
+- `status.<target>`: Lifecycle states and configure/action progress transitions.
+- `state.<target>`: Periodic operational device state and telemetry.
+- `health.<target>`: Component liveness and health reports.
 
 ---
 
@@ -292,9 +308,9 @@ The public API should provide, at minimum, support for:
 - health reporting
 - configure submission
 - action submission
-- result/status publication
+- result, status, and state publication (`PublishResult`, `PublishStatus`, `PublishState`)
 - desired config store/load/watch
-- handler registration for configure, action, result, and status
+- handler registration for configure, action, result, status, and state (`RegisterStateHandler`)
 - custom reconnect handler registration via `WithReconnectHandler(handler func())`
 
 The desired-config read API should return the decoded current desired-config record, including the config UUID needed for sync decisions.
@@ -314,7 +330,7 @@ The library must **not** implement deep cloud business-policy validation.
 
 Public APIs must return clear, typed errors with structured codes where appropriate.
 
-The library must safely recover from panics thrown in user-supplied configure, action, result, and status handlers (which are caught, logged, and recorded in metrics as failures) and the custom reconnect handler, preventing application crashes. For session-level connection/reconnection failures and panics originating in the custom reconnect handler callback, errors/panics must also be propagated to the registered `errorSink` (if provided).
+The library must safely recover from panics thrown in user-supplied configure, action, result, status, and state handlers (which are caught, logged, and recorded in metrics as failures) and the custom reconnect handler, preventing application crashes. For session-level connection/reconnection failures and panics originating in the custom reconnect handler callback, errors/panics must also be propagated to the registered `errorSink` (if provided).
 
 ---
 
@@ -360,3 +376,4 @@ The following are normative design invariants:
 8. Configure outcomes must include the **config UUID** that was attempted or applied.
 9. Revision-driven config ordering and rollback semantics are out of scope.
 10. Platform-specific execution logic remains outside the shared library.
+11. `state.<target>` is used exclusively for periodic operational state; `status.<target>` is reserved for lifecycle and execution progress.
